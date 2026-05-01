@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# ralph/afk.sh — autonomous ralph loop in a Docker Sandbox.
+# ralph/afk.sh — autonomous ralph loop running entirely on the local host.
 #
-# Each iteration runs `sbx run copilot . -- ...` against ralph/prompt.md plus
-# every open issue under issues/. Streams Copilot's text output to the
-# terminal and exits when the terminal assistant message of an iteration
-# contains the sentinel <promise>NO MORE TASKS</promise>.
+# Each iteration runs `copilot ...` against ralph/prompt.md plus every open
+# issue under issues/. Streams Copilot's text output to the terminal and
+# exits when the terminal assistant message of an iteration contains the
+# sentinel <promise>NO MORE TASKS</promise>.
 #
 # Usage:
 #   bash ralph/afk.sh                       # unlimited iterations
@@ -13,13 +13,9 @@
 #   MODEL=gpt-5.4 EFFORT=high bash ralph/afk.sh
 #
 # Prereqs (one-time):
-#   - sbx, copilot, jq, git on PATH.
-#   - sbx daemon running and signed in (`sbx login`).
-#   - A working GitHub Copilot credential stored as the sbx `github` secret.
-#     Verify before running this script:
-#         sbx run copilot . -- --yolo -p 'say hi'
-#     If that fails, see https://docs.docker.com/ai/sandboxes/ for setup
-#     options. This script never touches the secret.
+#   - copilot, jq, git on PATH.
+#   - GitHub Copilot CLI signed in (run `copilot` once interactively, or
+#     follow the auth flow at https://docs.github.com/copilot/github-copilot-in-the-cli).
 
 set -euo pipefail
 
@@ -42,11 +38,10 @@ fi
 MODEL="${MODEL:-claude-opus-4.7-1m-internal}"
 EFFORT="${EFFORT:-xhigh}"
 
-for cmd in sbx copilot jq git; do
+for cmd in copilot jq git; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "Error: '$cmd' not found on PATH." >&2
     case "$cmd" in
-      sbx)     echo "  Install: brew install docker/tap/sbx (then 'sbx login')" >&2 ;;
       copilot) echo "  Install: npm install -g @github/copilot" >&2 ;;
       jq)      echo "  Install: brew install jq" >&2 ;;
       git)     echo "  Install: brew install git" >&2 ;;
@@ -83,7 +78,7 @@ while true; do
   [ -z "$issues" ] && issues='No issues found'
   prompt="$(cat ralph/prompt.md)"
 
-  sbx run copilot . -- \
+  copilot \
       --model "$MODEL" \
       --effort "$EFFORT" \
       --yolo \
