@@ -6,7 +6,7 @@ A starter kit for running an **AFK (away-from-keyboard) AI coding loop** on top 
 
 **What you get:**
 - Four reusable Copilot CLI skills: `/grill-me`, `/write-prd`, `/prd-to-issues`, `/improve-codebase-architecture`, plus a `/tdd` discipline skill.
-- Two ready-to-run loop scripts: `ralph/ralph-once.sh` (single supervised pass) and `ralph/ralph-afk.sh` (full Docker-sandboxed loop until the backlog drains).
+- Two ready-to-run loop scripts, both Docker-sandboxed: `ralph/once.sh` (single-shot raw Copilot output, great for debugging) and `ralph/afk.sh` (autonomous loop until the backlog drains).
 - A shared `ralph/prompt.md` you can tune to fit your stack.
 
 **Stack-agnostic.** The example commands assume a Node/TypeScript project with `npm test` / `npm run typecheck` feedback loops, but you can swap those for any language's equivalents by editing `ralph/prompt.md`.
@@ -66,8 +66,8 @@ You don't need to use every phase. The skills are independent — pick what help
 │   ├── improve-codebase-architecture/SKILL.md
 │   └── tdd/SKILL.md
 ├── ralph/
-│   ├── ralph-once.sh         # Single AFK implementation pass (human-supervised, runs on host)
-│   ├── ralph-afk.sh          # Full autonomous loop (Docker sandboxed, runs until <promise>NO MORE TASKS</promise>)
+│   ├── once.sh         # Single sandboxed pass; raw Copilot output (use to debug or for the first run)
+│   ├── afk.sh          # Autonomous loop in Docker Sandboxes; exits on <promise>NO MORE TASKS</promise> or iteration cap
 │   └── prompt.md             # Shared agent prompt used by both scripts
 └── README.md
 ```
@@ -227,23 +227,23 @@ Correct horizontal slices before proceeding. The kanban structure turns your seq
 
 **Goal:** Let agents implement the kanban backlog autonomously.
 
-### ralph-once.sh — start here
+### once.sh — start here
 
 ```bash
 # From repo root — process every open issue
-bash ralph/ralph-once.sh
+bash ralph/once.sh
 
-# Or scope to one (or more) PRD issue folders by name. <prd-folder> is any
-# subfolder under issues/ (typically created by the prd-to-issues skill).
-bash ralph/ralph-once.sh <prd-folder>
-bash ralph/ralph-once.sh <prd-folder-a> <prd-folder-b>
+# Override the model or reasoning effort via env vars
+MODEL=gpt-5.4 EFFORT=high bash ralph/once.sh
 ```
 
 What it does:
-1. Reads open issues from `issues/**/*.md` (excluding `done/` archives) into a local variable. If `prd-folder` arguments are supplied, only `issues/<folder>/**/*.md` is read for each one.
-2. Grabs the last 5 git commits (for context continuity)
-3. Constructs a prompt with: issue backlog + commit history + implementation instructions
-4. Runs `copilot --yolo` directly on the host
+1. Reads open issues from `issues/**/*.md` (excluding `done/` archives).
+2. Grabs the last 5 git commits (for context continuity).
+3. Constructs a prompt with: issue backlog + commit history + implementation instructions.
+4. Runs `sbx run copilot . -- --yolo -p "$prompt"` — Copilot's full output streams straight to your terminal (no JSON, no jq, no sentinel logic — that's `afk.sh`'s job).
+
+Defaults: `MODEL=claude-opus-4.7-1m-internal`, `EFFORT=xhigh`. Override either with an env var (see the model table below).
 
 The agent will:
 - Pick the highest-priority AFK issue it can unblock
@@ -254,34 +254,31 @@ The agent will:
 
 Run this once, watch what it does, tune the prompt or skills if needed, then graduate to the full loop.
 
-### ralph-afk.sh — full autonomous loop
+### afk.sh — full autonomous loop
 
 ```bash
-# Run until every issue is done (no iteration cap)
-bash ralph/ralph-afk.sh
+# Run until the agent emits <promise>NO MORE TASKS</promise> (no iteration cap)
+bash ralph/afk.sh
 
-# Optionally pass one or more PRD issue folders to scope work to those PRDs.
-# <prd-folder> is any subfolder under issues/ (typically created by the
-# prd-to-issues skill).
-bash ralph/ralph-afk.sh <prd-folder>
-bash ralph/ralph-afk.sh <prd-folder-a> <prd-folder-b>
+# Cap at a specific number of iterations (positional, default unlimited)
+bash ralph/afk.sh 50
 
-# Help
-bash ralph/ralph-afk.sh --help
+# Override model / reasoning effort via env vars
+MODEL=gpt-5.4 EFFORT=high bash ralph/afk.sh 25
 ```
 
-This runs each iteration inside a **Docker Sandbox** (isolated microVM — own daemon, filesystem, and network) via `sbx run copilot . -- --yolo --output-format json -p "..."`. The loop:
-1. Picks next unblocked AFK issue
-2. Implements with TDD in a git work tree (isolated branch)
-3. Runs an automated **reviewer** pass in a fresh context (smart zone review, not dumb zone)
-4. Merges if clean; resolves type/test conflicts if not
-5. Loops to next issue **indefinitely**, only exiting when the agent emits `<promise>NO MORE TASKS</promise>` (or you Ctrl-C)
+This runs each iteration inside a **Docker Sandbox** (isolated microVM — own daemon, filesystem, and network) via `sbx run copilot . -- --yolo --output-format json -p "..."`. Each iteration is a fresh container — Memento Model by default. The loop:
+1. Picks the next unblocked AFK issue using the priority order in `ralph/prompt.md`
+2. Implements it under the `/tdd` discipline (red → green → refactor)
+3. Runs your project's feedback loops (tests, typecheck, etc., as configured in `AGENTS.md`)
+4. Commits the change and archives the issue file to `issues/<core-name>/done/`
+5. Loops to the next iteration, exiting when either (a) the agent emits `<promise>NO MORE TASKS</promise>`, (b) the optional iteration cap is reached, or (c) you Ctrl-C.
 
 ```
-The loop has no iteration cap. The agent owns the exit condition by
-emitting <promise>NO MORE TASKS</promise> when the kanban is drained.
-If you don't want it running forever, scope it to a PRD folder or stop
-it manually.
+The agent owns the exit condition: it emits <promise>NO MORE TASKS</promise>
+in its final assistant message when the kanban is drained. afk.sh greps
+for that sentinel and exits 0. Pass an integer iteration cap if you
+want a hard upper bound regardless.
 ```
 
 ```
@@ -301,19 +298,19 @@ A codebase with weak feedback loops produces weak AI output. No prompt engineeri
 
 ### Picking a Copilot CLI model
 
-Both scripts shell out to the GitHub Copilot CLI, which lets you pin a model with `--model <id>`. `ralph-once.sh` already passes `--model claude-opus-4.7-xhigh`; `ralph-afk.sh` does the same inside the sandboxed CLI invocation. Pick based on the iteration's job — implementer, long-context reviewer, or fast reasoner.
+Both scripts shell out to the GitHub Copilot CLI, which lets you pin a model with `--model <id>`. They default to `claude-opus-4.7-1m-internal` at `--effort xhigh`, both overridable via the `MODEL` and `EFFORT` env vars (e.g. `MODEL=gpt-5.4 EFFORT=high bash ralph/afk.sh`). Pick based on the iteration's job — implementer, long-context reviewer, or fast reasoner.
 
 | Model id | When to reach for it |
 |---|---|
-| `gpt-5.5` | Strong, fast generalist. Good default for `ralph-once.sh` when you want quick TDD iterations and don't need Opus-level long-form reasoning. Use for issue triage, scaffolding, and small vertical slices where latency matters more than depth. |
-| `claude-opus-4.7` | Baseline Opus 4.7. Best general-purpose **AFK implementer** — deep reasoning over a normal context window with predictable cost. Solid choice for `ralph-afk.sh` when issues are well-scoped and individually fit inside the smart zone (~100k tokens). |
-| `claude-opus-4.7-high` | Opus 4.7 with **high reasoning effort**. Use for the **automated reviewer pass** in `ralph-afk.sh`, gnarly debugging iterations, or issues with non-trivial architecture decisions where you'd rather burn tokens than ship a wrong design. |
-| `claude-opus-4.7-xhigh` | Opus 4.7 with **extra-high reasoning effort** (current default in both scripts). Pull this out for the hardest iterations — first vertical slice of a feature, schema/migration design, deep-module redesigns, or when an earlier iteration produced subtly wrong output and you want maximum think-time on the retry. Slowest and most expensive; use deliberately. |
+| `gpt-5.5` | Strong, fast generalist. Good default for `once.sh` when you want quick TDD iterations and don't need Opus-level long-form reasoning. Use for issue triage, scaffolding, and small vertical slices where latency matters more than depth. |
+| `claude-opus-4.7` | Baseline Opus 4.7. Best general-purpose **AFK implementer** — deep reasoning over a normal context window with predictable cost. Solid choice for `afk.sh` when issues are well-scoped and individually fit inside the smart zone (~100k tokens). |
+| `claude-opus-4.7-high` | Opus 4.7 with **high reasoning effort**. Use for the **automated reviewer pass** in `afk.sh`, gnarly debugging iterations, or issues with non-trivial architecture decisions where you'd rather burn tokens than ship a wrong design. |
+| `claude-opus-4.7-xhigh` | Opus 4.7 with **extra-high reasoning effort**. Pull this out for the hardest iterations — first vertical slice of a feature, schema/migration design, deep-module redesigns, or when an earlier iteration produced subtly wrong output and you want maximum think-time on the retry. Slowest and most expensive; use deliberately. |
 
 Rules of thumb:
 - **Implementer ≠ reviewer.** If you can afford it, run the implementer on `claude-opus-4.7` and the reviewer on `claude-opus-4.7-high` so the reviewer is structurally smarter than the code it's reviewing.
 - **Match model to context size.** Bigger context windows mean slower responses and more dumb-zone risk; only escalate when the prompt actually requires it.
-- **Escalate, don't camp.** Start `ralph-once.sh` runs on `gpt-5.5` or `claude-opus-4.7`; only graduate to `-high` / `-xhigh` for iterations that fail or for genuinely hard issues.
+- **Escalate, don't camp.** Start `once.sh` runs on `gpt-5.5` or `claude-opus-4.7`; only graduate to `-high` / `-xhigh` for iterations that fail or for genuinely hard issues.
 - **Tag the model in the prompt.** When you change models, mention it in the AFK prompt so the agent's self-talk matches its capability ceiling.
 
 ### Parallelization
@@ -401,6 +398,88 @@ You can also symlink instead of copy if you want edits in this repo to flow back
 
 ---
 
+## The AFK Prompt (`ralph/prompt.md`)
+
+Both `ralph/once.sh` and `ralph/afk.sh` pass the contents of `ralph/prompt.md` to Copilot as the agent's contract for each iteration. It defines how the agent reads the kanban, picks the next task, implements it, runs feedback loops, commits, and archives the issue. Tune this file to match your stack and team conventions.
+
+The shipped contract:
+
+````markdown
+# ISSUES
+
+Local issue files from `issues/` are provided at start of context. Issues are grouped per PRD into subfolders named after that PRD's core name, e.g. `issues/<core-name>/NNN-short-title.md`. The core name is derived from the PRD filename in `prds/` by stripping the date prefix (`YYYY-MM-DD-`) and the trailing `-prd` suffix. Files under any `done/` subfolder are excluded — those are archived. Parse the provided content to understand the open issues and which PRD each one belongs to.
+
+Each issue references its `Parent PRD` by a path relative to the project root (e.g. `prds/<YYYY-MM-DD>-<core-name>-prd.md`). PRDs live directly in `prds/` — there is no per-feature subfolder. Read the parent PRD when you need broader context, design decisions, or user stories.
+
+You will work on the AFK issues only, not the HITL ones.
+
+You've also been passed a file containing the last few commits. Review these to understand what work has been done.
+
+If all AFK tasks are complete, output <promise>NO MORE TASKS</promise>.
+
+# TASK SELECTION
+
+Pick the next task. Prioritize tasks in this order:
+
+1. Critical bugfixes
+2. Development infrastructure
+
+Getting development infrastructure like tests and types and dev scripts ready is an important precursor to building features.
+
+3. Tracer bullets for new features
+
+Tracer bullets are small slices of functionality that go through all layers of the system, allowing you to test and validate your approach early. This helps in identifying potential issues and ensures that the overall architecture is sound before investing significant time in development.
+
+TL;DR - build a tiny, end-to-end slice of the feature first, then expand it out.
+
+4. Polish and quick wins
+5. Refactors
+
+# EXPLORATION
+
+Explore the repo.
+
+# IMPLEMENTATION
+
+Use /tdd to complete the task.
+
+# FEEDBACK LOOPS
+
+Before committing, run the project's feedback loops (defined in `AGENTS.md`):
+
+- **Backend tests:** `uv run pytest tests/ --ignore=tests/integration -v`
+- **Frontend tests:** `cd frontend && npx playwright test`
+- **Frontend build:** `cd frontend && npm run build`
+- **Frontend lint:** `cd frontend && npx next lint`
+
+Run only the loops relevant to the files you changed. If your change is
+backend-only, skip the frontend loops; if frontend-only, skip the backend
+loop. Save Playwright reports to `tests/playwright/<YYYY-MM-DD-HHMMSS>/`
+when running them.
+
+# COMMIT
+
+Make a git commit. The commit message must:
+
+1. Include key decisions made
+2. Include files changed
+3. Blockers or notes for next iteration
+
+# THE ISSUE
+
+If the task is complete, move the issue file to a `done/` subfolder **inside the same per-PRD issues folder** (e.g. `issues/<core-name>/001-foo.md` → `issues/<core-name>/done/001-foo.md`). Create the `done/` folder if it doesn't exist. Do NOT move issues across PRD folders.
+
+If the task is not complete, add a note to the issue file with what was done.
+
+# FINAL RULES
+
+ONLY WORK ON A SINGLE TASK.
+````
+
+> The shipped feedback-loop commands above (`uv run pytest`, `npx playwright test`, `npm run build`, `npx next lint`) reflect the project this kit was extracted from. Replace them with your stack's equivalents — see [Customizing for Your Stack](#customizing-for-your-stack) below.
+
+---
+
 ## Customizing for Your Stack
 
 The runner scripts are intentionally thin. The two places that encode stack assumptions are:
@@ -411,8 +490,8 @@ The runner scripts are intentionally thin. The two places that encode stack assu
 Beyond that, the scripts only assume:
 - `git` is available and the repo has at least one commit
 - `copilot` CLI is on your `PATH`
-- For `ralph-afk.sh`: [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/get-started/) (`sbx`) is installed, the `sandboxd` daemon is running, you've signed in (`sbx login`), and a GitHub token is stored as the `github` secret (`echo "$(gh auth token)" | sbx secret set -g github`)
-- For `ralph-afk.sh`: `jq` is on your `PATH` (used for streaming + sentinel detection)
+- For both `once.sh` and `afk.sh`: [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/get-started/) (`sbx`) is installed, the `sandboxd` daemon is running, you've signed in (`sbx login`), and a working GitHub Copilot credential is stored as the sbx `github` secret. **Verify before running ralph:** `sbx run copilot . -- --yolo -p 'say hi'`. If that fails, see the Docker Sandboxes docs for setup options. The scripts never touch this secret — set it once and leave it alone.
+- For `afk.sh`: `jq` is on your `PATH` (used for streaming + sentinel detection)
 
 ---
 
@@ -438,9 +517,10 @@ Don't stuff it with 250k tokens of context — you'll start every session alread
 | Agent keeps re-exploring unnecessarily | Sub-agent results not summarized back cleanly | Check `AGENTS.md` config; ensure sub-agents are set up for summary-only return |
 | Type errors on every commit | Schema migration ran but app tables not updated | Run your project's migrate command before running the app |
 | PRD doc rot influencing bad agent decisions | Old PRD left in `prds/` after feature shipped | Mark as closed/archive; don't let stale docs accumulate |
-| `ralph-afk.sh` exits immediately with "No issues found" | `issues/` doesn't exist or all issues are under `done/` | Run `/prd-to-issues` first, or pass an explicit `<prd-folder>` that has open issues |
-| `ralph-afk.sh` fails with `sbx: command not found` or `daemon not reachable` | Docker Sandboxes not installed or daemon not running | `brew install docker/tap/sbx`, then `sbx daemon start -d` (or set up a launchd agent for auto-start), then `sbx login` |
-| Copilot CLI inside the sandbox can't auth | No GitHub token in sandbox secrets | `echo "$(gh auth token)" | sbx secret set -g github` (host token is injected via proxy, never stored inside the sandbox) |
+| `afk.sh` reports "No issues found" every iteration | `issues/` doesn't exist or all issues are under `done/` | Run `/prd-to-issues` first to populate the kanban |
+| `afk.sh` or `once.sh` fails with `sbx: command not found` or `daemon not reachable` | Docker Sandboxes not installed or daemon not running | `brew install docker/tap/sbx`, then `sbx daemon start -d` (or set up a launchd agent for auto-start), then `sbx login` |
+| Copilot CLI inside the sandbox can't auth | No working GitHub Copilot credential in the sbx `github` secret (or a previous version of `afk.sh` overwrote it) | Verify with `sbx run copilot . -- --yolo -p 'say hi'`. If that fails, follow the Docker Sandboxes auth setup. The current scripts never touch this secret. |
+| `afk.sh` aborts mid-pipeline with a `grep` or `jq` failure | Copilot produced no JSON events (likely an inner copilot crash; sbx swallows the exit code) | Re-run the iteration with `bash ralph/once.sh` to see Copilot's raw output and diagnose |
 
 ---
 
