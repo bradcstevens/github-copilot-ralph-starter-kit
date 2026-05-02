@@ -1,0 +1,14 @@
+[project]
+name = "github-copilot-ralph-starter-kit"
+version = "0.1.0"
+description = "A starter kit for running an AFK (away-from-keyboard) AI coding loop on top of the GitHub Copilot CLI."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+    "github-copilot-sdk>=0.3.0",
+    "rich>=13.7.0",
+]
+
+[tool.uv]
+package = false

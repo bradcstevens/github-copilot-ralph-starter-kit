@@ -6,7 +6,7 @@ A starter kit for running an **AFK (away-from-keyboard) AI coding loop** on top 
 
 **What you get:**
 - Four reusable Copilot CLI skills: `/grill-me`, `/write-prd`, `/prd-to-issues`, `/improve-codebase-architecture`, plus a `/tdd` discipline skill.
-- Two ready-to-run loop scripts: `ralph/grill.sh` (autonomous design phase: `/grill-me` → `/write-prd` → `/prd-to-issues`) and `ralph/afk.sh` (autonomous implementation loop until the backlog drains).
+- Two ready-to-run loop scripts written in Python on top of the [GitHub Copilot Python SDK](https://github.com/github/copilot-sdk/tree/main/python): `ralph/grill.py` (alignment-to-kanban: `/grill-me` → `/write-prd` → `/prd-to-issues`) and `ralph/afk.py` (autonomous loop until the backlog drains). Both stream Copilot's reasoning, tool calls, and tool output live to your terminal — same fidelity as running `copilot` interactively.
 - A shared `ralph/prompt.md` you can tune to fit your stack.
 
 **Stack-agnostic.** The example commands assume a Node/TypeScript project with `npm test` / `npm run typecheck` feedback loops, but you can swap those for any language's equivalents by editing `ralph/prompt.md`.
@@ -37,16 +37,20 @@ Every session starts from zero (system prompt). The agent forgets everything bet
 git clone https://github.com/bradcstevens/github-copilot-ralph-starter-kit my-project
 cd my-project
 
-# 2. Install the skills at the user level so /skillname works in any session.
+# 2. Sync the Python dependencies (github-copilot-sdk + rich) into a local venv.
+#    Requires uv (https://docs.astral.sh/uv/) and Python 3.11+.
+uv sync
+
+# 3. Install the skills at the user level so /skillname works in any session.
 mkdir -p ~/.copilot/skills
 cp -R .copilot/skills/* ~/.copilot/skills/
 
-# 3. Customize ralph/prompt.md for your stack (test command, typecheck command,
+# 4. Customize ralph/prompt.md for your stack (test command, typecheck command,
 #    repo conventions). The defaults assume npm test / npm run typecheck.
 
-# 4. (Optional) Add a minimal AGENTS.md to your repo root.
+# 5. (Optional) Add a minimal AGENTS.md to your repo root.
 
-# 5. Drop a starting brief into client-brief.md and start the workflow below.
+# 6. Drop a starting brief into client-brief.md and start the workflow below.
 copilot
 > /grill-me — see client-brief.md for context
 ```
@@ -66,9 +70,12 @@ You don't need to use every phase. The skills are independent — pick what help
 │   ├── improve-codebase-architecture/SKILL.md
 │   └── tdd/SKILL.md
 ├── ralph/
-│   ├── afk.sh          # Autonomous loop on the local host; exits on <promise>NO MORE TASKS</promise> or iteration cap
-│   ├── grill.sh        # Autonomous /grill-me → /write-prd → /prd-to-issues runner on the local host
-│   └── prompt.md             # Shared agent prompt used by afk.sh
+│   ├── afk.py          # Autonomous loop on the local host; exits on <promise>NO MORE TASKS</promise> or iteration cap
+│   ├── grill.py        # Autonomous /grill-me → /write-prd → /prd-to-issues runner on the local host
+│   ├── _runner.py      # Shared SDK client + rich-based event formatter
+│   ├── __init__.py     # Package marker so `python -m ralph.afk` works
+│   └── prompt.md       # Shared agent prompt used by afk.py
+├── pyproject.toml      # Declares github-copilot-sdk and rich as dependencies (`uv sync`)
 └── README.md
 ```
 
@@ -223,18 +230,20 @@ Correct horizontal slices before proceeding. The kanban structure turns your seq
 
 ---
 
-## Automating Phases 1–3 (`ralph/grill.sh`)
+## Automating Phases 1–3 (`ralph/grill.py`)
 
-`ralph/grill.sh` runs the full alignment-to-kanban path (`/grill-me` → `/write-prd` → `/prd-to-issues`) end-to-end, autonomously, in a single command. The agent acts as both interviewer and answerer — it presents its recommended answer for every branch of the design tree and accepts it as the chosen direction.
+`ralph/grill.py` runs the full alignment-to-kanban path (`/grill-me` → `/write-prd` → `/prd-to-issues`) end-to-end, autonomously, in a single command. The agent acts as both interviewer and answerer — it presents its recommended answer for every branch of the design tree and accepts it as the chosen direction.
+
+It uses the [GitHub Copilot Python SDK](https://github.com/github/copilot-sdk/tree/main/python) directly, so every event (reasoning, tool calls, tool output, compaction notices, per-session usage stats) streams to your terminal as it happens — the same fidelity you'd see running `copilot` interactively.
 
 Use it when you want an unattended first pass on a well-formed brief. Use the manual phases above when you actually need your own taste in the loop.
 
 ### How it maps to the manual phases
 
-| Manual phase | `grill.sh` step | Session strategy |
+| Manual phase | `grill.py` step | Session strategy |
 |---|---|---|
-| Phase 1 — `/grill-me` | Looped, exits on `<promise>GRILLING COMPLETE</promise>` | **Same** named session every iteration so design context accumulates |
-| (extra) Validation turn | One resume turn asking the agent to list/resolve any open decisions before producing the PRD | Same session — guards against a premature `GRILLING COMPLETE` |
+| Phase 1 — `/grill-me` | Looped, exits on `<promise>GRILLING COMPLETE</promise>` | **Same** in-process session every iteration so design context accumulates |
+| (extra) Validation turn | One follow-up turn asking the agent to list/resolve any open decisions before producing the PRD | Same session — guards against a premature `GRILLING COMPLETE` |
 | Phase 2 — `/write-prd` | Single turn; agent emits `<prd-path>/abs/path.md</prd-path>` | Same session — grill context still loaded |
 | Phase 3 — `/prd-to-issues` | Looped, exits on `<promise>ISSUES COMPLETE</promise>` | **New** session — fresh Memento-Model start for the kanban step, same as the manual workflow |
 
@@ -242,19 +251,22 @@ Use it when you want an unattended first pass on a well-formed brief. Use the ma
 
 ```bash
 # From a starting brief file
-bash ralph/grill.sh client-brief.md
+uv run python -m ralph.grill client-brief.md
 
 # Or from a literal quote
-bash ralph/grill.sh "Build a recipes app for amateur chefs"
+uv run python -m ralph.grill "Build a recipes app for amateur chefs"
 
 # Cap the grill loop at 30 iterations (default is unlimited)
-bash ralph/grill.sh client-brief.md 30
+uv run python -m ralph.grill client-brief.md 30
 
-# Override model / reasoning effort (same env vars as afk.sh)
-MODEL=gpt-5.4 EFFORT=high bash ralph/grill.sh client-brief.md
+# Override model / reasoning effort (same env vars as afk.py)
+MODEL=gpt-5.4 EFFORT=high uv run python -m ralph.grill client-brief.md
 
 # Cap the /prd-to-issues loop too (env, default unlimited)
-MAX_ISSUES_ITERS=10 bash ralph/grill.sh client-brief.md
+MAX_ISSUES_ITERS=10 uv run python -m ralph.grill client-brief.md
+
+# Bump the per-turn timeout (default 1800s / 30min)
+RALPH_TURN_TIMEOUT=3600 uv run python -m ralph.grill client-brief.md
 ```
 
 If `<file-or-quote>` resolves to an existing file, the agent is told to read it for context. Otherwise the value is treated as a verbatim quote and embedded in the kickoff prompt.
@@ -272,17 +284,17 @@ If a cap is hit before completion, the script exits non-zero and prints the sess
 copilot --resume="grill-20260501-153012-12345"
 ```
 
-A single-run lock (`.ralph-grill.lock`) prevents two concurrent runs from racing on `prds/` and `issues/`. Remove the directory by hand if a previous run was killed and left it behind.
+A single-run lock (`.ralph-grill.lock`, advisory `flock`) prevents two concurrent runs from racing on `prds/` and `issues/`. The lock file is left on disk; releasing only drops the file lock. Delete the file by hand only if `flock` somehow gets stuck (it shouldn't — `flock` is tied to the process FD, so if the holder dies the lock is released automatically).
 
 ### When to fall back to the manual workflow
 
-`grill.sh` deliberately strips the human-in-the-loop safety. Stay on the manual phases when:
+`grill.py` deliberately strips the human-in-the-loop safety. Stay on the manual phases when:
 
 - The brief is fuzzy and you genuinely don't know the answers — let `/grill-me` interview *you*, not itself.
 - Slice boundaries in the kanban are non-obvious and you want to review the proposed cut before issue files land.
 - You're working in an unfamiliar codebase and want the agent's exploration to surface as questions for you, not as silent auto-accepts.
 
-The output from `grill.sh` is still cheap to review — scan the PRD's modules section and the issue list before kicking off `afk.sh`, same as you would after the manual workflow.
+The output from `grill.py` is still cheap to review — scan the PRD's modules section and the issue list before kicking off `afk.py`, same as you would after the manual workflow.
 
 ---
 
@@ -290,42 +302,35 @@ The output from `grill.sh` is still cheap to review — scan the PRD's modules s
 
 **Goal:** Let agents implement the kanban backlog autonomously.
 
-### afk.sh — autonomous implementation loop
+### afk.py — the autonomous loop
 
 ```bash
-# Single iteration — watch what the agent does, then tune
-bash ralph/afk.sh 1
-
 # Run until the agent emits <promise>NO MORE TASKS</promise> (no iteration cap)
-bash ralph/afk.sh
+uv run python -m ralph.afk
 
 # Cap at a specific number of iterations (positional, default unlimited)
-bash ralph/afk.sh 50
+uv run python -m ralph.afk 50
 
 # Override model / reasoning effort via env vars
-MODEL=gpt-5.4 EFFORT=high bash ralph/afk.sh 25
+MODEL=gpt-5.4 EFFORT=high uv run python -m ralph.afk 25
+
+# Bump the per-turn timeout (default 1800s / 30min)
+RALPH_TURN_TIMEOUT=3600 uv run python -m ralph.afk 25
 ```
 
-Defaults: `MODEL=claude-opus-4.7-1m-internal`, `EFFORT=xhigh`. Override either with an env var (see the model table below).
+What it does each iteration:
 
-What it does, each iteration:
 1. Reads open issues from `issues/**/*.md` (excluding `done/` archives).
 2. Grabs the last 5 git commits (for context continuity).
-3. Constructs a prompt with: issue backlog + commit history + implementation instructions.
-4. Runs `copilot --yolo --output-format json -p "..."` and streams the response through `jq`, watching for the `<promise>NO MORE TASKS</promise>` sentinel.
-5. Each iteration is a fresh Copilot session — Memento Model by default.
-
-The agent will:
-- Pick the highest-priority AFK issue it can unblock under the `/tdd` discipline (red → green → refactor)
-- Execute your project's test and typecheck commands as feedback loops (defined in `AGENTS.md`)
-- Self-correct type errors before finishing
-- Commit the change and archive the issue file to `issues/<core-name>/done/`
-
-The loop exits when either (a) the agent emits `<promise>NO MORE TASKS</promise>`, (b) the optional iteration cap is reached, or (c) you Ctrl-C.
+3. Constructs a prompt with: issue backlog + commit history + `ralph/prompt.md`.
+4. Creates a **fresh `CopilotSession`** (Memento Model — every iteration starts from zero).
+5. Streams the agent's reasoning, tool calls, and tool output live to your terminal via the [Copilot Python SDK](https://github.com/github/copilot-sdk/tree/main/python). Permission prompts are auto-approved (equivalent to `--yolo`).
+6. Picks the next unblocked AFK issue using the priority order in `ralph/prompt.md`, runs **TDD** (red → green → refactor), executes your project's feedback loops, commits, archives the issue file to `issues/<core-name>/done/`.
+7. Loops to the next iteration, exiting when either (a) the agent emits `<promise>NO MORE TASKS</promise>`, (b) the optional iteration cap is reached, or (c) you Ctrl-C.
 
 ```
 The agent owns the exit condition: it emits <promise>NO MORE TASKS</promise>
-in its final assistant message when the kanban is drained. afk.sh greps
+in its final assistant message when the kanban is drained. afk.py greps
 for that sentinel and exits 0. Pass an integer iteration cap if you
 want a hard upper bound regardless.
 ```
@@ -347,24 +352,24 @@ A codebase with weak feedback loops produces weak AI output. No prompt engineeri
 
 ### Picking a Copilot CLI model
 
-Both `afk.sh` and `grill.sh` shell out to the GitHub Copilot CLI, which lets you pin a model with `--model <id>`. They default to `claude-opus-4.7-1m-internal` at `--effort xhigh`, both overridable via the `MODEL` and `EFFORT` env vars (e.g. `MODEL=gpt-5.4 EFFORT=high bash ralph/afk.sh`). Pick based on the iteration's job — implementer, long-context reviewer, or fast reasoner.
+Both scripts drive the GitHub Copilot CLI through the SDK, which lets you pin a model. They default to `claude-opus-4.7-1m-internal` at `EFFORT=xhigh`, both overridable via the `MODEL` and `EFFORT` env vars (e.g. `MODEL=gpt-5.4 EFFORT=high uv run python -m ralph.afk`). `EFFORT` is automatically dropped for models that don't expose a reasoning-effort capability (the runner queries `client.list_models()` once at startup and gates accordingly). Pick based on the iteration's job — implementer, long-context reviewer, or fast reasoner.
 
 | Model id | When to reach for it |
 |---|---|
 | `gpt-5.5` | Strong, fast generalist. Good default when you want quick TDD iterations and don't need Opus-level long-form reasoning. Use for issue triage, scaffolding, and small vertical slices where latency matters more than depth. |
-| `claude-opus-4.7` | Baseline Opus 4.7. Best general-purpose **AFK implementer** — deep reasoning over a normal context window with predictable cost. Solid choice for `afk.sh` when issues are well-scoped and individually fit inside the smart zone (~100k tokens). |
-| `claude-opus-4.7-high` | Opus 4.7 with **high reasoning effort**. Use for the **automated reviewer pass** in `afk.sh`, gnarly debugging iterations, or issues with non-trivial architecture decisions where you'd rather burn tokens than ship a wrong design. |
+| `claude-opus-4.7` | Baseline Opus 4.7. Best general-purpose **AFK implementer** — deep reasoning over a normal context window with predictable cost. Solid choice for `afk.py` when issues are well-scoped and individually fit inside the smart zone (~100k tokens). |
+| `claude-opus-4.7-high` | Opus 4.7 with **high reasoning effort**. Use for the **automated reviewer pass** in `afk.py`, gnarly debugging iterations, or issues with non-trivial architecture decisions where you'd rather burn tokens than ship a wrong design. |
 | `claude-opus-4.7-xhigh` | Opus 4.7 with **extra-high reasoning effort**. Pull this out for the hardest iterations — first vertical slice of a feature, schema/migration design, deep-module redesigns, or when an earlier iteration produced subtly wrong output and you want maximum think-time on the retry. Slowest and most expensive; use deliberately. |
 
 Rules of thumb:
 - **Implementer ≠ reviewer.** If you can afford it, run the implementer on `claude-opus-4.7` and the reviewer on `claude-opus-4.7-high` so the reviewer is structurally smarter than the code it's reviewing.
 - **Match model to context size.** Bigger context windows mean slower responses and more dumb-zone risk; only escalate when the prompt actually requires it.
-- **Escalate, don't camp.** Start `afk.sh` runs on `gpt-5.5` or `claude-opus-4.7`; only graduate to `-high` / `-xhigh` for iterations that fail or for genuinely hard issues.
+- **Escalate, don't camp.** Start with `gpt-5.5` or `claude-opus-4.7`; only graduate to `-high` / `-xhigh` for iterations that fail or for genuinely hard issues.
 - **Tag the model in the prompt.** When you change models, mention it in the AFK prompt so the agent's self-talk matches its capability ceiling.
 
 ### Parallelization
 
-For advanced use after you have the single-loop working: wrap the runner in a parallel DAG executor that picks independent issue groups, isolates each into its own git work tree, and merges them back when each iteration is clean. Use this once you trust the single-agent loop. The [SandCastle library](https://github.com/mattpocock/sandcastle) is one reference implementation of this pattern.
+For advanced use after you have the single-loop working: wrap the runner in a parallel DAG executor that picks independent issue groups, sandboxes each into its own git work tree, and merges them back when each iteration is clean. Use this once you trust the single-agent loop. The [SandCastle library](https://github.com/mattpocock/sandcastle) is one reference implementation of this pattern.
 
 ---
 
@@ -449,7 +454,7 @@ You can also symlink instead of copy if you want edits in this repo to flow back
 
 ## The AFK Prompt (`ralph/prompt.md`)
 
-`ralph/afk.sh` passes the contents of `ralph/prompt.md` to Copilot as the agent's contract for each iteration. It defines how the agent reads the kanban, picks the next task, implements it, runs feedback loops, commits, and archives the issue. Tune this file to match your stack and team conventions.
+Both `ralph/grill.py` (Phase 2 PRD step) and `ralph/afk.py` pass the contents of `ralph/prompt.md` to Copilot as the agent's contract for each iteration. It defines how the agent reads the kanban, picks the next task, implements it, runs feedback loops, commits, and archives the issue. Tune this file to match your stack and team conventions.
 
 The shipped contract:
 
@@ -538,8 +543,9 @@ The runner scripts are intentionally thin. The two places that encode stack assu
 
 Beyond that, the scripts only assume:
 - `git` is available and the repo has at least one commit
-- `copilot` CLI is on your `PATH` and signed in (run `copilot` once interactively, or follow the auth flow at https://docs.github.com/copilot/github-copilot-in-the-cli)
-- For `afk.sh` and `grill.sh`: `jq` is on your `PATH` (used for streaming and sentinel detection)
+- [`uv`](https://docs.astral.sh/uv/) is installed and the project's dependencies are synced (`uv sync`). The runners pull `github-copilot-sdk` and `rich` from `pyproject.toml`.
+- A working GitHub Copilot login is on this host. The Python SDK piggybacks on the same credentials the `copilot` CLI uses — verify with `copilot -p 'say hi'` once before running ralph.
+- `grill.py` and `afk.py` both run on the local host and stream the agent's reasoning, tool calls, and tool output live to your terminal. There is no Docker sandbox layer — the agent operates directly on your repo, same as if you'd run `copilot` interactively. Run from a clean working tree if you want to be able to revert easily.
 
 ---
 
@@ -565,11 +571,13 @@ Don't stuff it with 250k tokens of context — you'll start every session alread
 | Agent keeps re-exploring unnecessarily | Sub-agent results not summarized back cleanly | Check `AGENTS.md` config; ensure sub-agents are set up for summary-only return |
 | Type errors on every commit | Schema migration ran but app tables not updated | Run your project's migrate command before running the app |
 | PRD doc rot influencing bad agent decisions | Old PRD left in `prds/` after feature shipped | Mark as closed/archive; don't let stale docs accumulate |
-| `afk.sh` reports "No issues found" every iteration | `issues/` doesn't exist or all issues are under `done/` | Run `/prd-to-issues` first to populate the kanban |
-| `afk.sh` aborts mid-pipeline with a `grep` or `jq` failure | Copilot produced no JSON events (likely an inner copilot crash) | Re-run with `bash ralph/afk.sh 1` to isolate the iteration; if needed, invoke `copilot` directly without `--output-format json` to see Copilot's raw output |
-| `grill.sh` exits with "another ralph/grill.sh run appears to be in progress" | The `.ralph-grill.lock` directory is left over from a killed run | `rmdir .ralph-grill.lock` and re-run |
-| `grill.sh` exits 1 with "Validation turn did not re-emit" | Agent emitted `GRILLING COMPLETE` prematurely and couldn't re-confirm | Resume the printed session (`copilot --resume="grill-..."`) and finish grilling manually before re-running |
-| `grill.sh` exits 1 with "could not locate a generated PRD" | `/write-prd` never wrote the file (or wrote it outside `prds/`) | Resume the printed session with `copilot --resume="grill-..."`, finish the PRD by hand, then run `/prd-to-issues` directly |
+| `afk.py` reports "No issues found" every iteration | `issues/` doesn't exist or all issues are under `done/` | Run `/prd-to-issues` first to populate the kanban |
+| `ModuleNotFoundError: No module named 'copilot'` or `'rich'` | Dependencies haven't been synced into the project venv | `uv sync` from the repo root, then re-run with `uv run python -m ralph.afk` |
+| Agent immediately errors with auth failure | No working Copilot login on this host | Run `copilot -p 'say hi'` interactively to confirm/refresh login, then re-run ralph |
+| `afk.py` or `grill.py` exits with `TimeoutError` mid-turn | Single turn ran longer than the per-turn timeout | Increase via `RALPH_TURN_TIMEOUT=3600 uv run python -m ralph.afk` (default 1800s) |
+| `grill.py` exits with "another ralph/grill.py run appears to be in progress" | Another run is actively holding the `flock` on `.ralph-grill.lock` | Wait for it to finish, or kill the holding process — `flock` is released automatically when the process dies |
+| `grill.py` exits 1 with "Validation turn did not re-emit" | Agent emitted `GRILLING COMPLETE` prematurely and couldn't re-confirm | Resume the printed session (`copilot --resume="grill-..."`) and finish grilling manually before re-running |
+| `grill.py` exits 1 with "could not locate a generated PRD" | `/write-prd` never wrote the file (or wrote it outside `prds/`) | Resume the printed session with `copilot --resume="grill-..."`, finish the PRD by hand, then run `/prd-to-issues` directly |
 
 ---
 

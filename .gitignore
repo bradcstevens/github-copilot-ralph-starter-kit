@@ -13,6 +13,18 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.python-version
+*.egg-info/
+
+# uv lockfile and local cache (let users regenerate on `uv sync`)
+uv.lock
+
 # Project artifacts that shouldn't be checked in when this kit is used in a real project
 # (kept here so the template is safe to copy into your own repo)
 node_modules/
@@ -26,6 +38,7 @@ coverage/
 
 # Ralph runtime
 ralph/.tmp/
+.ralph-grill.lock
 
 # Project-local PRDs and issues (these live next to your code, not in the template)
 prds/
