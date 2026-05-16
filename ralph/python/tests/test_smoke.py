@@ -205,3 +205,70 @@ def test_ralph_afk_missing_prompt_fails_cleanly(tmp_path) -> None:
     assert "prompt" in result.stderr.lower(), (
         f"expected mention of prompt file in stderr; stderr was:\n{result.stderr}"
     )
+
+
+def test_disabled_otel_does_not_import_opentelemetry() -> None:
+    """OTel posture: with telemetry disabled, ``opentelemetry`` MUST NOT
+    appear in ``sys.modules`` after importing the full ralph_afk surface.
+
+    This is the load-bearing contract for issue #12: the ``[otel]`` extra
+    is opt-in. Operators who haven't installed it (or who haven't set
+    ``RALPH_OTEL_ENABLED`` / ``OTEL_EXPORTER_OTLP_ENDPOINT``) MUST never
+    pay the OTel import cost — and crucially, MUST NOT trip an
+    ``ImportError`` traceback at module-load time on the base install.
+
+    Asserted by spawning a fresh Python subprocess (with both env vars
+    unset) that imports ``ralph_afk.loop`` (the heaviest module that
+    touches the telemetry seam) and the telemetry seam itself, then
+    exits zero iff ``opentelemetry`` is absent from ``sys.modules``.
+    """
+    script = (
+        "import os, sys\n"
+        # Belt-and-braces: ensure no env-var hint that would enable OTel.
+        "os.environ.pop('RALPH_OTEL_ENABLED', None)\n"
+        "os.environ.pop('OTEL_EXPORTER_OTLP_ENDPOINT', None)\n"
+        "import ralph_afk.loop  # noqa: F401\n"
+        "import ralph_afk.telemetry.otel  # noqa: F401\n"
+        "from ralph_afk.telemetry import otel\n"
+        # Exercise the public seam — these MUST NOT import opentelemetry
+        # when the seam is disabled.
+        "assert otel.is_enabled() is False\n"
+        "assert otel.build_sdk_telemetry_config() is None\n"
+        "with otel.span('smoke') as s:\n"
+        "    s.set_attribute('k', 'v')\n"
+        "otel.force_flush()\n"
+        "leaked = [m for m in sys.modules if m == 'opentelemetry' "
+        "or m.startswith('opentelemetry.')]\n"
+        "if leaked:\n"
+        "    print('LEAK: ' + ','.join(leaked))\n"
+        "    sys.exit(2)\n"
+        "print('OK')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+        env={
+            # Inherit just enough to find the venv; explicitly drop the
+            # OTel env vars in case the host shell has them set.
+            **{
+                k: v
+                for k, v in __import__("os").environ.items()
+                if k not in ("RALPH_OTEL_ENABLED", "OTEL_EXPORTER_OTLP_ENDPOINT")
+            },
+        },
+    )
+    assert result.returncode == 0, (
+        f"expected exit 0 with 'OK'; got exit {result.returncode}\n"
+        f"stdout={result.stdout!r}\n"
+        f"stderr={result.stderr!r}"
+    )
+    assert "OK" in result.stdout, (
+        f"expected 'OK' in stdout; got stdout={result.stdout!r}"
+    )
+    assert "LEAK" not in result.stdout, (
+        f"opentelemetry leaked into sys.modules even when disabled:\n"
+        f"{result.stdout}"
+    )

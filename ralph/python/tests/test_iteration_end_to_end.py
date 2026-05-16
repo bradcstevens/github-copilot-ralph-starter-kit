@@ -1025,3 +1025,199 @@ def test_loop_multiple_iterations_until_cap(tmp_path, monkeypatch) -> None:
     json_files = list((tmp_path / ".ralph" / "runs").glob("*.json"))
     payload = json.loads(json_files[0].read_text(encoding="utf-8"))
     assert len(payload["iterations"]) == 3
+
+
+# ---------------------------------------------------------------------------
+# OpenTelemetry span tree (issue #12)
+# ---------------------------------------------------------------------------
+
+
+def test_loop_emits_otel_span_tree_when_enabled(tmp_path, monkeypatch) -> None:
+    """OTel-on: one iteration emits the documented span tree.
+
+    Expected shape::
+
+        ralph_afk.run
+        └─ ralph_afk.iteration  (attrs: iter, issue, issues)
+           ├─ ralph_afk.collect_issues
+           ├─ ralph_afk.session
+           └─ ralph_afk.enforce_closures
+
+    Skips if the ``[otel]`` extra is not installed so the suite stays
+    green on the base install.
+    """
+    # -- 0) Install OTel in-memory exporter BEFORE the loop opens any
+    #       spans. The seam reuses an externally-installed
+    #       TracerProvider on first init (see telemetry.otel docstring).
+    try:
+        from opentelemetry import trace
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+            InMemorySpanExporter,
+        )
+        from opentelemetry.util._once import Once
+    except ImportError:  # pragma: no cover
+        pytest.skip("opentelemetry not installed (run with --extra otel)")
+
+    from ralph_afk.telemetry import otel as telemetry
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    # Bypass `set_tracer_provider`'s set-once guard (same pattern as
+    # the in_memory_exporter fixture in test_telemetry_otel.py).
+    monkeypatch.setattr(trace, "_TRACER_PROVIDER", provider, raising=False)
+    monkeypatch.setattr(
+        trace, "_TRACER_PROVIDER_SET_ONCE", Once(), raising=False
+    )
+
+    # Wipe sticky-enable cache + flip RALPH_OTEL_ENABLED so the seam
+    # picks up the externally-installed provider on its first init().
+    telemetry.reset_for_tests()
+    monkeypatch.setenv("RALPH_OTEL_ENABLED", "1")
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+
+    # -- 1) Fake repo on disk ---------------------------------------------
+    (tmp_path / "ralph").mkdir()
+    (tmp_path / "ralph" / "prompt.md").write_text(
+        "You are ralph.\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+
+    # -- 2) git stubs ------------------------------------------------------
+    monkeypatch.setattr(git_module, "repo_root", lambda start=None: tmp_path)
+    monkeypatch.setattr(git_module, "is_dirty", lambda start=None: False)
+
+    head_sequence = iter(["pre-sha-abc", "post-sha-xyz"])
+
+    def fake_head_sha(start: Any = None) -> str:
+        return next(head_sequence)
+
+    monkeypatch.setattr(git_module, "head_sha", fake_head_sha)
+    monkeypatch.setattr(
+        git_module,
+        "recent_commits",
+        lambda n, start=None: [
+            _FakeCommit(sha="0" * 40, subject="prior commit")
+        ],
+    )
+    monkeypatch.setattr(
+        git_module,
+        "commits_between",
+        lambda pre, head, start=None: [
+            _FakeCommit(
+                sha="abcdef1234567890abcdef1234567890abcdef12",
+                subject="feat: stuff",
+                body="Closes #42",
+            )
+        ],
+    )
+
+    # -- 3) gh stubs -------------------------------------------------------
+    issue_42 = _make_issue(42)
+
+    monkeypatch.setattr(gh_module, "auth_status", lambda: True)
+    monkeypatch.setattr(
+        gh_module,
+        "repo_view",
+        lambda: gh_module.Repo(owner="x", name="y", default_branch="main"),
+    )
+    monkeypatch.setattr(
+        gh_module,
+        "issue_list",
+        lambda label, state="open": [issue_42],
+    )
+
+    issue_42_state = {"value": "OPEN"}
+
+    def fake_issue_view(number: int) -> gh_module.Issue:
+        return gh_module.Issue(
+            number=number,
+            title=issue_42.title,
+            body=issue_42.body,
+            labels=issue_42.labels,
+            state=issue_42_state["value"],
+            url=issue_42.url,
+            comments=(),
+        )
+
+    def fake_issue_close(number: int, comment: str) -> None:
+        issue_42_state["value"] = "CLOSED"
+
+    monkeypatch.setattr(gh_module, "issue_view", fake_issue_view)
+    monkeypatch.setattr(gh_module, "issue_close", fake_issue_close)
+
+    # -- 4) SDK stub (minimal: empty event flow) ---------------------------
+    fake_client = FakeCopilotClient(scripted_events=[])
+    monkeypatch.setattr(loop_module, "_make_client", lambda: fake_client)
+
+    # -- 5) Run loop with max_iterations=1 ---------------------------------
+    cfg = RunConfig(
+        issue_source="github",
+        max_iterations=1,
+        max_nmt_strikes=3,
+        otel_enabled=True,
+    )
+
+    exit_code = asyncio.run(loop_module.run(cfg))
+    assert exit_code == 0, f"expected exit 0, got {exit_code}"
+
+    # -- 6) Drain & inspect spans -----------------------------------------
+    telemetry.force_flush()
+    spans = exporter.get_finished_spans()
+
+    by_name: dict[str, list[Any]] = {}
+    for s in spans:
+        by_name.setdefault(s.name, []).append(s)
+
+    # Expected five spans, one of each documented name.
+    expected_names = {
+        "ralph_afk.run",
+        "ralph_afk.iteration",
+        "ralph_afk.collect_issues",
+        "ralph_afk.session",
+        "ralph_afk.enforce_closures",
+    }
+    seen_names = set(by_name)
+    assert expected_names <= seen_names, (
+        f"missing expected spans; "
+        f"expected {expected_names}, got {seen_names}"
+    )
+
+    # Exactly one of each.
+    for name in expected_names:
+        assert len(by_name[name]) == 1, (
+            f"expected exactly one {name!r} span; got {len(by_name[name])}"
+        )
+
+    run_span = by_name["ralph_afk.run"][0]
+    iter_span = by_name["ralph_afk.iteration"][0]
+    collect_span = by_name["ralph_afk.collect_issues"][0]
+    session_span = by_name["ralph_afk.session"][0]
+    closures_span = by_name["ralph_afk.enforce_closures"][0]
+
+    # Parent relationships: run → iteration → {collect, session, closures}.
+    assert run_span.parent is None, "ralph_afk.run is the root span"
+    assert iter_span.parent is not None
+    assert iter_span.parent.span_id == run_span.context.span_id, (
+        "ralph_afk.iteration must nest under ralph_afk.run"
+    )
+    for child in (collect_span, session_span, closures_span):
+        assert child.parent is not None
+        assert child.parent.span_id == iter_span.context.span_id, (
+            f"{child.name!r} must nest under ralph_afk.iteration; "
+            f"saw parent span_id {child.parent.span_id!r}"
+        )
+
+    # Iteration attrs: iter + issue + issues set after pool collect.
+    attrs = dict(iter_span.attributes or {})
+    assert attrs.get("iter") == 1, f"iter attr: {attrs!r}"
+    assert attrs.get("issue") == 42, f"issue attr: {attrs!r}"
+    issues_attr = attrs.get("issues")
+    assert issues_attr is not None, f"issues attr missing: {attrs!r}"
+    # `issues` is stored as a tuple/list of ints — OTel normalises to
+    # a sequence.
+    assert list(issues_attr) == [42], f"issues attr: {issues_attr!r}"

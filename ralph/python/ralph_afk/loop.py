@@ -89,7 +89,7 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable
 
-from copilot import CopilotClient
+from copilot import CopilotClient, SubprocessConfig
 
 from ralph_afk import events as events_module
 from ralph_afk import git as git_module
@@ -107,6 +107,7 @@ from ralph_afk.sources import (
     IssueSource,
     PrdsIssueSource,
 )
+from ralph_afk.telemetry import otel as telemetry
 from ralph_afk.ui import Renderer, RunSummary, get_console
 from ralph_afk.wrapper import NMTStrikeStateMachine
 
@@ -119,15 +120,41 @@ __all__ = ["run"]
 _DEFAULT_SEND_TIMEOUT_SECONDS: float = 7200.0
 
 
+def _build_subprocess_config() -> SubprocessConfig:
+    """Construct the SDK :class:`SubprocessConfig` used by :func:`_make_client`.
+
+    Factored out so the OTel telemetry seam is the **single switch** —
+    the loop body and the production :func:`_make_client` do not contain
+    ``if otel_enabled`` branches. When OTel is disabled,
+    :func:`telemetry.build_sdk_telemetry_config` returns ``None`` and
+    the SDK skips its telemetry env-var setup; when enabled, the SDK
+    sets ``COPILOT_OTEL_ENABLED=true`` and forwards ``OTLP_ENDPOINT``
+    when present.
+
+    Returns:
+        A :class:`SubprocessConfig` with at most one populated field
+        (``telemetry``). All other knobs (``cli_path``, ``log_level``,
+        etc.) are left at SDK defaults; operators who need custom
+        values can set the SDK's documented env vars (e.g.
+        ``COPILOT_CLI_PATH``) — the SDK reads them in
+        ``client._resolve_cli_path``.
+    """
+    return SubprocessConfig(
+        telemetry=telemetry.build_sdk_telemetry_config(),
+    )
+
+
 def _make_client() -> CopilotClient:
     """Construct the per-invocation :class:`CopilotClient`.
 
     Factored to its own module-level function so tests can monkeypatch
     it (``monkeypatch.setattr("ralph_afk.loop._make_client", ...)``) to
     return a fake. Production callers get the SDK's default
-    construction.
+    construction wrapped with the telemetry config produced by
+    :func:`_build_subprocess_config` — which is a no-op when OTel is
+    disabled (``SubprocessConfig.telemetry is None``).
     """
-    return CopilotClient()
+    return CopilotClient(_build_subprocess_config())
 
 
 def _make_issue_source(
@@ -288,171 +315,192 @@ class _Loop:
             * ``"empty_pool"`` — AFK-ready pool was empty; clean exit 0.
             * ``"stale_worktree"`` — dirty worktree; abort exit 1.
             * ``"aborted"`` — NMT strike machine tripped; abort exit 1.
+
+        OTel span tree: opens ``ralph_afk.iteration`` for the entire body,
+        with three children — ``ralph_afk.collect_issues`` around the
+        pool discovery, ``ralph_afk.session`` around the SDK session
+        lifecycle, and ``ralph_afk.enforce_closures`` around the
+        source-specific completion backstop. Empty-pool and
+        stale-worktree paths emit only the partial subtree (no
+        ``session`` / ``enforce_closures`` spans); see
+        ``tests/test_iteration_end_to_end.py::test_loop_emits_otel_span_tree_when_enabled``.
         """
-        self._emit(
-            events_module.WRAPPER_ITERATION_START,
-            iter_num=iter_num,
-        )
-
-        # 1) Stale-worktree guard (bash line 315).
-        if git_module.is_dirty(self._repo_root):
+        with telemetry.span(
+            "ralph_afk.iteration", iter=iter_num
+        ) as iteration_span:
             self._emit(
-                events_module.WRAPPER_STALE_WORKTREE_ABORTED,
+                events_module.WRAPPER_ITERATION_START,
                 iter_num=iter_num,
             )
-            # Close the snapshot the renderer just opened so the run-end
-            # Table doesn't show a half-open row.
-            self._emit(events_module.WRAPPER_ITERATION_END, iter_num=iter_num)
-            self._record_counters(iter_num)
-            return ("stale_worktree", 0, 0)
 
-        # 2) Collect AFK-ready pool via the source.
-        pool = self._source.collect_afk_ready()
-        pool_refs: list[int | str] = [item.ref for item in pool]
-        self._emit(
-            events_module.WRAPPER_AFK_READY_COLLECTED,
-            iter_num=iter_num,
-            issues=pool_refs,
-        )
-        if not pool:
-            # Close the iteration cleanly so the snapshot lifecycle is
-            # consistent even on the empty-pool path.
+            # 1) Stale-worktree guard (bash line 315).
+            if git_module.is_dirty(self._repo_root):
+                self._emit(
+                    events_module.WRAPPER_STALE_WORKTREE_ABORTED,
+                    iter_num=iter_num,
+                )
+                # Close the snapshot the renderer just opened so the run-end
+                # Table doesn't show a half-open row.
+                self._emit(events_module.WRAPPER_ITERATION_END, iter_num=iter_num)
+                self._record_counters(iter_num)
+                return ("stale_worktree", 0, 0)
+
+            # 2) Collect AFK-ready pool via the source.
+            with telemetry.span("ralph_afk.collect_issues"):
+                pool = self._source.collect_afk_ready()
+            pool_refs: list[int | str] = [item.ref for item in pool]
+            # Late-bind the iteration span's `issue` / `issues` attributes
+            # now that we know the pool. `set_attribute` is no-op-safe so
+            # this works whether OTel is enabled or not.
+            if pool_refs:
+                iteration_span.set_attribute("issue", pool_refs[0])
+                iteration_span.set_attribute("issues", pool_refs)
             self._emit(
-                events_module.WRAPPER_ITERATION_END,
+                events_module.WRAPPER_AFK_READY_COLLECTED,
                 iter_num=iter_num,
+                issues=pool_refs,
             )
-            self._record_counters(iter_num)
-            return ("empty_pool", 0, 0)
+            if not pool:
+                # Close the iteration cleanly so the snapshot lifecycle is
+                # consistent even on the empty-pool path.
+                self._emit(
+                    events_module.WRAPPER_ITERATION_END,
+                    iter_num=iter_num,
+                )
+                self._record_counters(iter_num)
+                return ("empty_pool", 0, 0)
 
-        # 3) Build prompt (last-5 commits + AFK-ready item blocks + prompt body).
-        try:
-            recent = git_module.recent_commits(5, self._repo_root)
-        except git_module.GitError as exc:
-            self._diag.warning("recent_commits failed: %s; using empty prefix", exc)
-            recent = []
-        commits_block = _format_recent_commits(recent)
-        issues_block = "\n\n".join(item.rendered_block for item in pool)
-        prompt = (
-            f"Previous commits: {commits_block} "
-            f"Issues: {issues_block} {self._prompt_text}"
-        )
+            # 3) Build prompt (last-5 commits + AFK-ready item blocks + prompt body).
+            try:
+                recent = git_module.recent_commits(5, self._repo_root)
+            except git_module.GitError as exc:
+                self._diag.warning("recent_commits failed: %s; using empty prefix", exc)
+                recent = []
+            commits_block = _format_recent_commits(recent)
+            issues_block = "\n\n".join(item.rendered_block for item in pool)
+            prompt = (
+                f"Previous commits: {commits_block} "
+                f"Issues: {issues_block} {self._prompt_text}"
+            )
 
-        # 4) Capture pre_sha *after* the slow source-collection step so
-        #    any commit that landed while we were enriching the pool
-        #    isn't incorrectly attributed to this iteration.
-        try:
-            pre_sha = git_module.head_sha(self._repo_root)
-        except git_module.GitError as exc:
-            self._diag.error("git head_sha failed: %s; aborting iteration", exc)
-            self._emit(events_module.WRAPPER_ITERATION_END, iter_num=iter_num)
-            self._record_counters(iter_num)
-            return ("continue", 0, 0)
+            # 4) Capture pre_sha *after* the slow source-collection step so
+            #    any commit that landed while we were enriching the pool
+            #    isn't incorrectly attributed to this iteration.
+            try:
+                pre_sha = git_module.head_sha(self._repo_root)
+            except git_module.GitError as exc:
+                self._diag.error("git head_sha failed: %s; aborting iteration", exc)
+                self._emit(events_module.WRAPPER_ITERATION_END, iter_num=iter_num)
+                self._record_counters(iter_num)
+                return ("continue", 0, 0)
 
-        # 5) Run the SDK session.
-        send_timeout = _send_timeout_seconds()
-        try:
-            async with IterationSession(
-                self._client,
-                config=self._config,
-                event_log=self._writers.event_log,
-                renderer=self._renderer,
-                run_id=self._writers.run_id,
-                iter_num=iter_num,
-                model=self._config.model,
-            ) as sdk_session:
+            # 5) Run the SDK session.
+            send_timeout = _send_timeout_seconds()
+            with telemetry.span("ralph_afk.session"):
                 try:
-                    await sdk_session.send_and_wait(
-                        prompt, timeout=send_timeout
-                    )
-                except asyncio.TimeoutError:
-                    self._diag.warning(
-                        "SDK send_and_wait timed out after %ss; "
-                        "treating iteration as no-progress",
-                        send_timeout,
-                    )
+                    async with IterationSession(
+                        self._client,
+                        config=self._config,
+                        event_log=self._writers.event_log,
+                        renderer=self._renderer,
+                        run_id=self._writers.run_id,
+                        iter_num=iter_num,
+                        model=self._config.model,
+                    ) as sdk_session:
+                        try:
+                            await sdk_session.send_and_wait(
+                                prompt, timeout=send_timeout
+                            )
+                        except asyncio.TimeoutError:
+                            self._diag.warning(
+                                "SDK send_and_wait timed out after %ss; "
+                                "treating iteration as no-progress",
+                                send_timeout,
+                            )
+                        except Exception as exc:
+                            # Match bash line 365-367 — treat any copilot failure
+                            # as no-progress; bookkeeping below still runs.
+                            self._diag.warning(
+                                "SDK send_and_wait raised %s: %s; "
+                                "treating iteration as no-progress",
+                                type(exc).__name__, exc,
+                            )
                 except Exception as exc:
-                    # Match bash line 365-367 — treat any copilot failure
-                    # as no-progress; bookkeeping below still runs.
-                    self._diag.warning(
-                        "SDK send_and_wait raised %s: %s; "
-                        "treating iteration as no-progress",
+                    self._diag.error(
+                        "IterationSession lifecycle failed: %s: %s; iteration aborted",
                         type(exc).__name__, exc,
                     )
-        except Exception as exc:
-            self._diag.error(
-                "IterationSession lifecycle failed: %s: %s; iteration aborted",
-                type(exc).__name__, exc,
-            )
 
-        # 6) Post-iteration accounting.
-        try:
-            head = git_module.head_sha(self._repo_root)
-        except git_module.GitError as exc:
-            self._diag.warning(
-                "post-iteration git head_sha failed: %s; "
-                "skipping commit accounting", exc,
-            )
-            head = pre_sha
-        try:
-            new_commits = git_module.commits_between(
-                pre_sha, head, self._repo_root
-            )
-        except git_module.GitError as exc:
-            self._diag.warning(
-                "post-iteration commits_between failed: %s; "
-                "skipping commit accounting", exc,
-            )
-            new_commits = []
+            # 6) Post-iteration accounting.
+            try:
+                head = git_module.head_sha(self._repo_root)
+            except git_module.GitError as exc:
+                self._diag.warning(
+                    "post-iteration git head_sha failed: %s; "
+                    "skipping commit accounting", exc,
+                )
+                head = pre_sha
+            try:
+                new_commits = git_module.commits_between(
+                    pre_sha, head, self._repo_root
+                )
+            except git_module.GitError as exc:
+                self._diag.warning(
+                    "post-iteration commits_between failed: %s; "
+                    "skipping commit accounting", exc,
+                )
+                new_commits = []
 
-        for c in new_commits:
-            self._emit(
-                events_module.WRAPPER_COMMIT_RECORDED,
-                iter_num=iter_num,
-                sha=c.sha,
-                subject=c.subject,
-                date=c.date,
+            for c in new_commits:
+                self._emit(
+                    events_module.WRAPPER_COMMIT_RECORDED,
+                    iter_num=iter_num,
+                    sha=c.sha,
+                    subject=c.subject,
+                    date=c.date,
+                )
+
+            # 7) Completion backstop — source-specific. The GitHub backend
+            #    closes the issue via gh; the PRDs backend always returns
+            #    [] (the agent owns the `git mv ... done/` step).
+            with telemetry.span("ralph_afk.enforce_closures"):
+                completions = self._handle_completions_safely(pool, new_commits)
+            for completion in completions:
+                self._emit(
+                    events_module.WRAPPER_AUTO_CLOSE,
+                    iter_num=iter_num,
+                    issue=completion.ref,
+                    sha=completion.sha,
+                    shas=list(completion.shas),
+                )
+            auto_closures = len(completions)
+
+            # 8) Strike state machine + emit appropriate events.
+            outcome = self._strike_machine.tick(
+                commits_in_iter=len(new_commits),
+                auto_closures_in_iter=auto_closures,
             )
+            if outcome == "aborted" or (
+                len(new_commits) == 0 and auto_closures == 0
+            ):
+                # Either we just hit the strike threshold OR this iteration
+                # had no progress (a single strike). Either way emit the
+                # wrapper.strike event so the renderer + persist see it.
+                self._emit(
+                    events_module.WRAPPER_STRIKE,
+                    iter_num=iter_num,
+                    strikes=self._strike_machine.strikes,
+                    max_strikes=self._config.max_nmt_strikes,
+                    outcome=("abort" if outcome == "aborted" else "warn"),
+                )
 
-        # 7) Completion backstop — source-specific. The GitHub backend
-        #    closes the issue via gh; the PRDs backend always returns
-        #    [] (the agent owns the `git mv ... done/` step).
-        completions = self._handle_completions_safely(pool, new_commits)
-        for completion in completions:
-            self._emit(
-                events_module.WRAPPER_AUTO_CLOSE,
-                iter_num=iter_num,
-                issue=completion.ref,
-                sha=completion.sha,
-                shas=list(completion.shas),
-            )
-        auto_closures = len(completions)
+            # 9) Close the iteration snapshot, persist counters.
+            self._emit(events_module.WRAPPER_ITERATION_END, iter_num=iter_num)
+            self._record_counters(iter_num)
 
-        # 8) Strike state machine + emit appropriate events.
-        outcome = self._strike_machine.tick(
-            commits_in_iter=len(new_commits),
-            auto_closures_in_iter=auto_closures,
-        )
-        if outcome == "aborted" or (
-            len(new_commits) == 0 and auto_closures == 0
-        ):
-            # Either we just hit the strike threshold OR this iteration
-            # had no progress (a single strike). Either way emit the
-            # wrapper.strike event so the renderer + persist see it.
-            self._emit(
-                events_module.WRAPPER_STRIKE,
-                iter_num=iter_num,
-                strikes=self._strike_machine.strikes,
-                max_strikes=self._config.max_nmt_strikes,
-                outcome=("abort" if outcome == "aborted" else "warn"),
-            )
-
-        # 9) Close the iteration snapshot, persist counters.
-        self._emit(events_module.WRAPPER_ITERATION_END, iter_num=iter_num)
-        self._record_counters(iter_num)
-
-        if outcome == "aborted":
-            return ("aborted", len(new_commits), auto_closures)
-        return ("continue", len(new_commits), auto_closures)
+            if outcome == "aborted":
+                return ("aborted", len(new_commits), auto_closures)
+            return ("continue", len(new_commits), auto_closures)
 
     def _handle_completions_safely(
         self,
@@ -709,14 +757,20 @@ async def run(config: RunConfig) -> int:
     try:
         try:
             with writers.event_log, writers.run_summary:
-                try:
-                    exit_code = await loop.drive()
-                except Exception as exc:
-                    diag.error(
-                        "ralph_afk loop crashed: %s: %s",
-                        type(exc).__name__, exc,
-                    )
-                    exit_code = 1
+                # Root OTel span for the entire iteration loop. The
+                # SDK's subprocess telemetry (configured via
+                # _build_subprocess_config) nests under this span's
+                # W3C trace context — see ralph_afk.telemetry.otel
+                # module docstring for the propagation contract.
+                with telemetry.span("ralph_afk.run"):
+                    try:
+                        exit_code = await loop.drive()
+                    except Exception as exc:
+                        diag.error(
+                            "ralph_afk loop crashed: %s: %s",
+                            type(exc).__name__, exc,
+                        )
+                        exit_code = 1
         except Exception as exc:
             # Writer __exit__ raised (disk full, perm denied flushing
             # the run-summary JSON, etc.). The body already ran; we
@@ -739,5 +793,13 @@ async def run(config: RunConfig) -> int:
                 await client.stop()
             except Exception as exc:
                 diag.warning("CopilotClient.stop() failed: %s", exc)
+        # Drain OTel exporters AFTER the root `ralph_afk.run` span has
+        # closed. BatchSpanProcessor buffers — without an explicit
+        # flush, spans queued near the end of the run could be dropped
+        # on process exit. No-op when OTel is disabled.
+        try:
+            telemetry.force_flush()
+        except Exception as exc:  # pragma: no cover - defensive
+            diag.warning("telemetry.force_flush() failed: %s", exc)
 
     return exit_code
