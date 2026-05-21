@@ -385,12 +385,41 @@ def main(argv: list[str] | None = None) -> int:
     # message before we pay the cost of importing the loop module
     # (which transitively pulls in the SDK and Rich).
     try:
-        resolve_repo_root()
+        repo_root = resolve_repo_root()
     except RuntimeError as exc:
         print(f"ralph-afk: error: {exc}", file=sys.stderr)
         return 1
 
+    # _build_config runs cheap env-var validations (ISSUE_SOURCE,
+    # MAX_NMT_STRIKES, REASONING_EFFORT, …) that may raise SystemExit.
+    # We want those argparse-style failures to surface before the
+    # agent-skills preflight so an operator who set ``ISSUE_SOURCE=gitlab``
+    # sees the unknown-source error rather than a "config missing" red
+    # herring.
     config = _build_config(args)
+
+    # Preflight: the AFK loop cannot safely run /setup-agent-skills itself
+    # (the skill is interactive — it asks the operator to pick an issue
+    # tracker, label vocabulary, and context-doc layout, then shows a draft
+    # for confirmation before writing). Under ``copilot --yolo -p`` the
+    # agent would have to invent those answers, baking the wrong defaults
+    # into ``docs/agents/*.md``. So we refuse to start until a human has
+    # run ``/setup-agent-skills`` in an interactive copilot session and
+    # produced the config files. Detection signal: existence of
+    # ``docs/agents/issue-tracker.md`` (the first of the triplet
+    # ``/setup-agent-skills`` writes). Mirrors the bash runner's preflight
+    # at ``ralph/sh-afk.sh``.
+    issue_tracker_doc = repo_root / "docs" / "agents" / "issue-tracker.md"
+    if not issue_tracker_doc.is_file():
+        print(
+            "ralph-afk: error: docs/agents/issue-tracker.md not found.\n"
+            "  This repo has not been configured with /setup-agent-skills yet.\n"
+            "  In an interactive 'copilot' session from the repo root, run:\n"
+            "    > /setup-agent-skills\n"
+            "  Then re-run ralph-afk. See docs/customization.md for details.",
+            file=sys.stderr,
+        )
+        return 1
 
     # Import here so the SDK / Rich / pricing only load if we're
     # actually going to run. Keeps `ralph-afk --help` snappy.

@@ -135,11 +135,23 @@ def test_ralph_afk_prds_empty_pool_exits_zero(tmp_path, monkeypatch) -> None:
     PRDs mode is now implemented (issue #11). Without a ``prds/``
     directory, :meth:`PrdsIssueSource.collect_afk_ready` returns ``[]``
     which the loop treats as the empty-pool fast path → exit 0.
+
+    Also satisfies the ``docs/agents/issue-tracker.md`` preflight by
+    creating a stub config file — that preflight refuses to start the
+    loop until ``/setup-agent-skills`` has been run, regardless of
+    ``ISSUE_SOURCE`` (the agent-skills config is needed by downstream
+    skills in both modes).
     """
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     # Provide a prompt file so we don't fail on prompt resolution.
     (tmp_path / "ralph").mkdir()
     (tmp_path / "ralph" / "PROMPT.md").write_text("be ralph", encoding="utf-8")
+    # Satisfy the agent-skills preflight (mirrors what /setup-agent-skills
+    # writes for a local-markdown / 'other' issue-tracker choice).
+    (tmp_path / "docs" / "agents").mkdir(parents=True)
+    (tmp_path / "docs" / "agents" / "issue-tracker.md").write_text(
+        "Stub: local-markdown issue tracker.\n", encoding="utf-8"
+    )
     monkeypatch.setenv("ISSUE_SOURCE", "prds")
     result = subprocess.run(
         _ralph_afk_command(),
@@ -183,9 +195,58 @@ def test_ralph_afk_outside_git_repo_fails_cleanly(tmp_path) -> None:
     )
 
 
+def test_ralph_afk_missing_agent_skills_config_fails_cleanly(tmp_path) -> None:
+    """``ralph-afk`` refuses to start when ``docs/agents/issue-tracker.md`` is missing.
+
+    The AFK loop cannot safely run ``/setup-agent-skills`` itself (the
+    skill is interactive and would force the agent to invent answers
+    under ``copilot --yolo -p``). The CLI preflight detects an
+    unconfigured repo by the absence of ``docs/agents/issue-tracker.md``
+    and refuses to start with a clear, non-traceback error pointing the
+    operator at ``/setup-agent-skills``.
+
+    Mirrors the bash runner's equivalent preflight in ``ralph/sh-afk.sh``.
+    """
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    # Provide a prompt file so the prompt-not-found preflight does not
+    # short-circuit before the agent-skills preflight fires.
+    (tmp_path / "ralph").mkdir()
+    (tmp_path / "ralph" / "PROMPT.md").write_text("be ralph", encoding="utf-8")
+    # Deliberately do NOT create docs/agents/issue-tracker.md.
+    result = subprocess.run(
+        _ralph_afk_command(),
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode != 0, (
+        "ralph-afk should fail when docs/agents/issue-tracker.md is missing; "
+        f"got exit 0 with stdout={result.stdout!r}"
+    )
+    assert "Traceback" not in result.stderr, (
+        f"expected friendly error, got traceback:\n{result.stderr}"
+    )
+    assert "docs/agents/issue-tracker.md" in result.stderr, (
+        f"expected mention of docs/agents/issue-tracker.md in stderr; "
+        f"stderr was:\n{result.stderr}"
+    )
+    assert "/setup-agent-skills" in result.stderr, (
+        f"expected mention of /setup-agent-skills in stderr; "
+        f"stderr was:\n{result.stderr}"
+    )
+
+
 def test_ralph_afk_missing_prompt_fails_cleanly(tmp_path) -> None:
     """``ralph-afk`` inside a repo that lacks ``ralph/PROMPT.md`` fails with a clean message."""
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    # Satisfy the agent-skills preflight so the prompt-file check is the
+    # next preflight to fire (this test pins the prompt-file contract).
+    (tmp_path / "docs" / "agents").mkdir(parents=True)
+    (tmp_path / "docs" / "agents" / "issue-tracker.md").write_text(
+        "Stub: local-markdown issue tracker.\n", encoding="utf-8"
+    )
     # No ralph/ directory.
     result = subprocess.run(
         _ralph_afk_command(),

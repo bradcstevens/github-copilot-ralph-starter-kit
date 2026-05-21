@@ -7,7 +7,7 @@
 1. Replace every backticked placeholder like `` `<PROJECT_NAME>` `` with real content. Grep for `<[A-Z_]` to find them.
 2. Read every `> 📝` blockquote note and act on it, then delete the note.
 3. Delete any section whose first line is `> 🗑️ DELETE IF NOT APPLICABLE` that you don't need.
-4. Save as `BRIEF.md` (drop the `.template.` segment).
+4. Save as `SPEC.md` (drop the `.template.` segment).
 5. When the brief is final, run `/to-prd` to publish it to your issue tracker as the parent PRD, then `/to-issues` to break it into AFK-ready slice issues.
 6. Delete this whole **How to use this template** section.
 

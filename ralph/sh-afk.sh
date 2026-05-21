@@ -108,6 +108,23 @@ if [ ! -f ralph/PROMPT.md ]; then
   exit 1
 fi
 
+# Preflight: the AFK loop cannot safely run /setup-agent-skills itself (the skill
+# is interactive — it asks the operator to pick an issue tracker, label vocabulary,
+# and context-doc layout, then shows a draft for confirmation before writing).
+# Under `copilot --yolo -p` the agent would have to invent those answers, baking
+# the wrong defaults into docs/agents/*.md. So we refuse to start until a human
+# has run /setup-agent-skills in an interactive copilot session and produced the
+# config files. Detection signal: existence of docs/agents/issue-tracker.md
+# (the first of the triplet /setup-agent-skills writes).
+if [ ! -f docs/agents/issue-tracker.md ]; then
+  echo "Error: docs/agents/issue-tracker.md not found." >&2
+  echo "       This repo has not been configured with /setup-agent-skills yet." >&2
+  echo "       In an interactive 'copilot' session from the repo root, run:" >&2
+  echo "         > /setup-agent-skills" >&2
+  echo "       Then re-run this script. See docs/customization.md for details." >&2
+  exit 1
+fi
+
 # jq filters tuned to the Copilot CLI --output-format json event shape.
 # stream_text emits each delta's text + a newline at end of each assistant.message.
 # final_result extracts the last terminal assistant.message content for the sentinel.

@@ -92,8 +92,21 @@ def _install_fake_runner(
     the precedence the operator will actually hit) but stop short of
     creating an SDK client. Capturing the composed :class:`RunConfig`
     is enough for the assertions below.
+
+    Also writes a stub ``docs/agents/issue-tracker.md`` under ``tmp_path``
+    so the CLI's agent-skills preflight passes — these tests pin the
+    reasoning-effort precedence contract, not the agent-skills
+    configuration preflight (which has dedicated coverage in
+    ``tests/test_smoke.py``).
     """
     monkeypatch.setattr(cli_module, "resolve_repo_root", lambda: tmp_path)
+
+    issue_tracker_doc = tmp_path / "docs" / "agents" / "issue-tracker.md"
+    issue_tracker_doc.parent.mkdir(parents=True, exist_ok=True)
+    issue_tracker_doc.write_text(
+        "Stub: agent-skills preflight satisfied for reasoning-effort tests.\n",
+        encoding="utf-8",
+    )
 
     async def _fake_run(cfg: RunConfig) -> int:
         captured.append(cfg)
