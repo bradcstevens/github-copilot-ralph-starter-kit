@@ -47,6 +47,8 @@ __all__ = [
     "repo_root",
     "head_sha",
     "is_dirty",
+    "current_branch",
+    "switch",
     "commits_between",
     "recent_commits",
     "range_count",
@@ -248,6 +250,65 @@ def is_dirty(start: Path | str | None = None) -> bool:
                 cmd, completed.returncode, _stderr_tail(completed.stderr)
             )
     return False
+
+
+def current_branch(start: Path | str | None = None) -> str | None:
+    """Return the name of the currently checked-out branch, or ``None``.
+
+    Uses ``git symbolic-ref --quiet --short HEAD``. Returns ``None`` when
+    HEAD is detached (no symbolic ref). ``gh pr checkout`` normally leaves
+    a named branch, but a detached HEAD is a valid state the caller must
+    handle (e.g. skip the base-branch restore rather than guess a name).
+
+    Args:
+        start: Directory inside the repo to run from. Defaults to cwd.
+
+    Returns:
+        The short branch name (e.g. ``"main"``), or ``None`` on detached HEAD.
+
+    Raises:
+        GitError: If ``git`` is not on PATH, or ``symbolic-ref`` fails for
+            a reason other than detached HEAD (exit code > 1).
+    """
+    cmd = [_GIT_BIN, "symbolic-ref", "--quiet", "--short", "HEAD"]
+    try:
+        completed = subprocess.run(
+            cmd,
+            cwd=str(start) if start is not None else None,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise GitError(cmd, 127, "git not found on PATH") from exc
+    if completed.returncode == 0:
+        name = completed.stdout.strip()
+        return name or None
+    if completed.returncode == 1:
+        # `symbolic-ref --quiet` exits 1 with no output on a detached HEAD.
+        return None
+    raise GitError(cmd, completed.returncode, _stderr_tail(completed.stderr))
+
+
+def switch(branch: str, start: Path | str | None = None) -> None:
+    """Check out an existing local branch by name.
+
+    Thin wrapper over ``git checkout <branch>`` (``checkout`` rather than the
+    newer ``git switch`` for maximum compatibility with the git versions the
+    kit targets). The loop uses this to restore the base branch after an
+    iteration that ran ``gh pr checkout`` left ``HEAD`` on a PR branch.
+
+    Args:
+        branch: Name of an existing local branch to check out.
+        start: Directory inside the repo to run from. Defaults to cwd.
+
+    Raises:
+        GitError: If ``git`` is not on PATH or the checkout fails (e.g. the
+            branch doesn't exist, or the checkout would clobber local changes).
+    """
+    _run(["checkout", branch], cwd=start)
 
 
 def commits_between(

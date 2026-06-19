@@ -100,7 +100,7 @@ uv run --project ralph/python ralph-afk
 uv run --project ralph/python ralph-afk 50
 ```
 
-**For everything else** — env vars, per-iteration flow, exit conditions, the commit-message contract, and how the prompt routes work to `/diagnose` / `/prototype` / `/tdd` / `/improve-codebase-architecture` / `/grill-with-docs` / `/zoom-out` — see [`docs/runners.md`](runners.md).
+**For everything else** — env vars, per-iteration flow, exit conditions, the commit-message contract, and how the prompt routes work to `/diagnosing-bugs` / `/prototype` / `/tdd` / `/codebase-design` (with the human-only steps inlined) — see [`docs/runners.md`](runners.md).
 
 ## Phase 7 — QA
 

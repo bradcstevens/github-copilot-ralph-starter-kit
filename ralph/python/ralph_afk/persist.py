@@ -53,7 +53,7 @@ The :class:`RunSummaryWriter` emits a single JSON document on close::
         {
           "iter": 1,                                       # 1-based iteration index
           "duration_seconds": 27.84,                       # float, seconds
-          "model": "claude-opus-4.7-xhigh",                # str | null
+          "model": "claude-opus-4.8",                      # str | null
           "tokens_in": 12345,                              # int (per-iteration sum)
           "tokens_out": 678,                               # int (per-iteration sum)
           "context_used": 13023,                           # int, cumulative context tokens

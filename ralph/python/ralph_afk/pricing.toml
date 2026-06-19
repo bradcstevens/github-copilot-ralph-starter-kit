@@ -11,12 +11,19 @@
 #   output_per_mtok  — USD per million output tokens (Decimal-parseable scalar)
 #   context_window   — model context window in tokens (positive integer)
 #
-# Naming: keys are the model identifiers exposed by the Copilot CLI (see the
-# kit-wide MODEL env var). Adding or removing entries here does NOT change the
-# runner's behaviour for unknown models — pricing.estimate_cost returns None
-# for any model not present in this table so the renderer can show "—".
+# Naming: keys are the bare base model identifiers the Copilot CLI reports in
+# usage events (model id and reasoning effort are separate axes, so there is no
+# "-xhigh" suffix here — see the kit-wide MODEL env var). Adding or removing
+# entries here does NOT change the runner's behaviour for unknown models —
+# pricing.estimate_cost returns None for any model not present in this table so
+# the renderer can show "—".
 
-[models."claude-opus-4.7-xhigh"]
+[models."claude-opus-4.8"]
+input_per_mtok  = 15.00
+output_per_mtok = 75.00
+context_window  = 200_000
+
+[models."claude-opus-4.7"]
 input_per_mtok  = 15.00
 output_per_mtok = 75.00
 context_window  = 200_000

@@ -29,12 +29,17 @@ deep-module knobs:
 
 Env vars:
 
-* ``MODEL`` — Copilot model id override.
+* ``MODEL`` — Copilot model id override. Use a bare base id (e.g.
+  ``claude-opus-4.8``); the runner sends the model id and reasoning
+  effort as separate axes. A trailing ``-<effort>`` segment is still
+  accepted for convenience and is peeled off into ``reasoning_effort``.
 * ``REASONING_EFFORT`` — Optional reasoning-effort override
-  (``low`` / ``medium`` / ``high`` / ``xhigh``). When unset, the runner
-  auto-derives a safe default from the resolved model id's suffix —
-  e.g. ``claude-opus-4.7-xhigh`` → ``xhigh`` — so the kit's default
-  model works out-of-the-box without a 400 from the backend.
+  (``low`` / ``medium`` / ``high`` / ``xhigh`` / ``max``). When unset,
+  the runner derives it from a ``MODEL`` suffix (e.g.
+  ``claude-opus-4.7-xhigh`` → ``xhigh``), or — on a pure default
+  invocation — from the kit default, then gates it against the model's
+  supported set (a model that supports no reasoning effort is sent
+  ``None``).
 * ``ISSUE_SOURCE`` — ``github`` (default, GitHub issues backend) or
   ``prds`` (legacy local-markdown ``prds/<feature>/NNN-*.md`` backend).
 * ``MAX_NMT_STRIKES`` — strike threshold (integer ≥ 1).
@@ -57,13 +62,25 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ralph_afk.config import REASONING_EFFORTS, RunConfig
+from ralph_afk.config import (
+    MODEL_REASONING_EFFORTS,
+    REASONING_EFFORTS,
+    SUPPORTED_MODELS,
+    RunConfig,
+)
 
 __all__ = ["main", "build_parser", "resolve_repo_root"]
 
 _DEFAULT_MAX_NMT_STRIKES = 3
-# Default model used when ``MODEL`` is unset.
-_DEFAULT_MODEL = "claude-opus-4.7-xhigh"
+# Default model used when ``MODEL`` is unset. A bare base id (model id and
+# reasoning effort are separate axes on the live Copilot CLI — a suffixed
+# id like ``claude-opus-4.7-xhigh`` is rejected as "not available").
+_DEFAULT_MODEL = "claude-opus-4.8"
+# Reasoning effort applied only on a *pure default invocation* (neither
+# ``MODEL`` nor ``REASONING_EFFORT`` set), preserving the kit's
+# "works out of the box at full reasoning" intent. Once the operator
+# picks a model, effort comes from the env / model suffix / model default.
+_DEFAULT_REASONING_EFFORT = "max"
 
 
 def resolve_repo_root(start: Path | None = None) -> Path:
@@ -136,13 +153,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "Environment variables:\n"
-            "  MODEL                       Copilot model id override.\n"
+            "  MODEL                       Copilot model id override "
+            "(bare base id, e.g. claude-opus-4.8).\n"
             "  REASONING_EFFORT            Reasoning-effort override "
-            "(low|medium|high|xhigh).\n"
-            "                              When unset, auto-derived "
-            "from the model id suffix\n"
+            "(low|medium|high|xhigh|max).\n"
+            "                              When unset, derived from a "
+            "MODEL suffix\n"
             "                              (e.g. "
-            "claude-opus-4.7-xhigh → xhigh).\n"
+            "claude-opus-4.7-xhigh → xhigh) then gated per model.\n"
             "  ISSUE_SOURCE                'github' (default) or 'prds' "
             "(legacy local-markdown).\n"
             "  MAX_NMT_STRIKES             Strike threshold (default: 3).\n"
@@ -269,6 +287,21 @@ def _resolve_issue_source() -> str:
     return source
 
 
+def _resolve_include_prs() -> bool | None:
+    """Read the ``INCLUDE_PRS`` env override; ``None`` when unset.
+
+    ``None`` means "no explicit override" — the loop then auto-detects the
+    PR surface from ``docs/agents/issue-tracker.md`` (the
+    ``PRs as a request surface: yes/no`` flag the skills write). A set value
+    forces the behaviour: ``1`` / ``true`` / ``yes`` / ``on`` enable PRs;
+    anything else (``0`` / ``false`` / ``no`` / ``off`` / ...) disables them.
+    """
+    raw = os.environ.get("INCLUDE_PRS")
+    if raw is None or not raw.strip():
+        return None
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _resolve_pricing_file() -> Path | None:
     """Read ``RALPH_PRICING_FILE`` and return a Path or None."""
     raw = os.environ.get("RALPH_PRICING_FILE")
@@ -277,58 +310,137 @@ def _resolve_pricing_file() -> Path | None:
     return Path(raw)
 
 
+def _warn(message: str) -> None:
+    """Emit a non-fatal warning to stderr with the kit's prefix."""
+    print(f"ralph-afk: warning: {message}", file=sys.stderr)
+
+
+def _split_model_suffix(model: str | None) -> tuple[str | None, str | None]:
+    """Split a model id into ``(base_model_id, suffix_effort)``.
+
+    The kit historically let operators encode reasoning effort as a
+    trailing ``-<effort>`` segment on the model id (e.g.
+    ``claude-opus-4.7-xhigh``). The live Copilot CLI, however, treats the
+    model id and the reasoning effort as **separate** axes and rejects a
+    suffixed id outright ("Model 'claude-opus-4.7-xhigh' is not
+    available."). This helper peels a recognised effort suffix off so the
+    CLI receives the bare base id while the effort is still honoured.
+
+    Only a trailing segment that exactly matches a known effort
+    (:data:`REASONING_EFFORTS`) is treated as a suffix, so ids whose tail
+    merely looks wordy — ``gpt-5.4-mini``, ``gpt-5.3-codex``,
+    ``mai-code-1-flash-internal`` — are left intact.
+
+    Returns:
+        ``(base_model, effort)`` where ``effort`` is the stripped suffix,
+        or ``None`` when there is no recognised suffix.
+    """
+    if not model:
+        return model, None
+    for effort in REASONING_EFFORTS:
+        suffix = f"-{effort}"
+        if model.endswith(suffix) and len(model) > len(suffix):
+            return model[: -len(suffix)], effort
+    return model, None
+
+
 def _derive_reasoning_effort_from_model(model: str | None) -> str | None:
-    """Derive a default ``reasoning_effort`` from a model id suffix.
+    """Return the trailing ``-<effort>`` segment of a model id, if any.
 
-    Some Copilot model ids pin the supported reasoning effort to a
-    single value and surface that pin via the trailing ``-<effort>``
-    segment of the model id — for example ``claude-opus-4.7-xhigh``
-    only accepts ``"xhigh"`` and the backend rejects the service-default
-    ``"medium"`` with a CAPI 400. Returning the suffix matches the only
-    supported value for such variants so the SDK call goes through
-    on the very first iteration.
-
-    Models without a recognised suffix return ``None`` so the SDK
-    sends no ``reasoningEffort`` field and the backend applies its own
-    default — preserving today's behaviour for non-pinned models.
+    A thin, independently-tested wrapper over :func:`_split_model_suffix`
+    retained as a stable seam. Models without a recognised ``-<effort>``
+    suffix return ``None``.
 
     Args:
         model: The resolved model id, or ``None``.
 
     Returns:
-        One of ``"low"`` / ``"medium"`` / ``"high"`` / ``"xhigh"`` if
-        the model id ends with that suffix, otherwise ``None``.
+        One of :data:`REASONING_EFFORTS` if the model id ends with that
+        suffix, otherwise ``None``.
     """
-    if not model:
-        return None
-    for effort in REASONING_EFFORTS:
-        if model.endswith(f"-{effort}"):
-            return effort
-    return None
+    return _split_model_suffix(model)[1]
 
 
-def _resolve_reasoning_effort(model: str | None) -> str | None:
-    """Resolve ``reasoning_effort`` from env-var override or model suffix.
+def _resolve_model_and_effort(
+    model_env: str | None, effort_env: str | None
+) -> tuple[str, str | None]:
+    """Resolve the ``(model_id, reasoning_effort)`` pair the loop sends.
 
-    Precedence:
+    Implements the kit's model/effort policy:
 
-    1. ``REASONING_EFFORT`` env var (must be one of the documented
-       literals; an invalid value is a hard ``SystemExit`` because the
-       SDK would otherwise raise mid-iteration).
-    2. Auto-derived from the model id (see
-       :func:`_derive_reasoning_effort_from_model`).
-    3. ``None`` (let the backend pick).
+    1. **Model id is a bare base id.** Any recognised ``-<effort>`` suffix
+       on ``MODEL`` is peeled off (the live CLI rejects suffixed ids) and
+       feeds effort resolution instead.
+    2. **Effort precedence:** ``REASONING_EFFORT`` env (validated) >
+       ``MODEL`` suffix > the kit default (only on a *pure* default
+       invocation, i.e. ``MODEL`` unset) > ``None`` (let the backend pick).
+    3. **Per-model capability gate** (:data:`MODEL_REASONING_EFFORTS`):
+       a model that supports no reasoning effort is forced to ``None``
+       (the CLI hard-rejects ``session.create`` otherwise); an effort
+       outside a *known* model's documented set is passed through with a
+       warning (the CLI is the final authority); an *unknown* model is
+       passed through with a warning.
+
+    Args:
+        model_env: Raw ``MODEL`` env value (``None`` if unset).
+        effort_env: Raw ``REASONING_EFFORT`` env value (``None`` if unset).
+
+    Returns:
+        ``(base_model_id, reasoning_effort_or_None)``.
+
+    Raises:
+        SystemExit: if ``REASONING_EFFORT`` is set to a value outside
+            :data:`REASONING_EFFORTS` (rejected eagerly rather than
+            crashing mid-iteration).
     """
-    raw = os.environ.get("REASONING_EFFORT")
-    if raw is not None and raw.strip():
-        candidate = raw.strip().lower()
+    model_raw = model_env or _DEFAULT_MODEL
+    base_model, suffix_effort = _split_model_suffix(model_raw)
+    # base_model is non-None because model_raw is a non-empty string.
+    assert base_model is not None
+
+    # 1) effort + whether the operator asked for it explicitly.
+    effort: str | None
+    effort_explicit: bool
+    if effort_env is not None and effort_env.strip():
+        candidate = effort_env.strip().lower()
         if candidate not in REASONING_EFFORTS:
             raise SystemExit(
                 f"ralph-afk: error: REASONING_EFFORT must be one of "
-                f"{sorted(REASONING_EFFORTS)}, got {raw!r}"
+                f"{sorted(REASONING_EFFORTS)}, got {effort_env!r}"
             )
-        return candidate
-    return _derive_reasoning_effort_from_model(model)
+        effort, effort_explicit = candidate, True
+    elif suffix_effort is not None:
+        effort, effort_explicit = suffix_effort, True
+    elif model_env is None:
+        effort, effort_explicit = _DEFAULT_REASONING_EFFORT, False
+    else:
+        effort, effort_explicit = None, False
+
+    # 2) per-model capability gate.
+    allowed = MODEL_REASONING_EFFORTS.get(base_model)
+    if allowed is None:
+        _warn(
+            f"model {base_model!r} is not in the kit's supported model set "
+            f"({sorted(SUPPORTED_MODELS)}); passing it through to the "
+            f"Copilot CLI unchanged."
+        )
+        return base_model, effort
+    if not allowed:
+        # Model accepts no reasoning effort at all — must send None or the
+        # CLI rejects session.create.
+        if effort is not None and effort_explicit:
+            _warn(
+                f"model {base_model!r} does not support reasoning-effort "
+                f"configuration; ignoring requested effort {effort!r}."
+            )
+        return base_model, None
+    if effort is not None and effort not in allowed:
+        _warn(
+            f"model {base_model!r} documents reasoning efforts "
+            f"{sorted(allowed)}; passing {effort!r} through anyway "
+            f"(the Copilot CLI is the final authority)."
+        )
+    return base_model, effort
 
 
 def _build_config(args: argparse.Namespace) -> RunConfig:
@@ -344,15 +456,18 @@ def _build_config(args: argparse.Namespace) -> RunConfig:
     verbosity = min(max(int(args.verbosity), 0), 3)
 
     issue_source = _resolve_issue_source()
+    include_prs = _resolve_include_prs()
     max_nmt_strikes = _resolve_max_nmt_strikes()
 
-    model = os.environ.get("MODEL") or _DEFAULT_MODEL
-    reasoning_effort = _resolve_reasoning_effort(model)
+    model = os.environ.get("MODEL")
+    reasoning_effort = os.environ.get("REASONING_EFFORT")
+    model, reasoning_effort = _resolve_model_and_effort(model, reasoning_effort)
 
     return RunConfig(
         model=model,
         reasoning_effort=reasoning_effort,
         issue_source=issue_source,  # type: ignore[arg-type]
+        include_prs=include_prs,
         max_iterations=int(args.max_iterations),
         max_nmt_strikes=max_nmt_strikes,
         deny_tools=frozenset(deny_tools),

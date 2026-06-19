@@ -20,11 +20,14 @@ from ralph_afk.gh import (
     Comment,
     GhError,
     Issue,
+    PullRequest,
     Repo,
     auth_status,
     issue_close,
     issue_list,
     issue_view,
+    pr_list,
+    pr_view,
     repo_view,
 )
 
@@ -490,3 +493,182 @@ def test_gh_error_truncates_long_stderr_via_helper() -> None:
     trimmed = gh._stderr_tail(long)
     assert len(trimmed) < 1000
     assert trimmed.startswith("...")
+
+
+# --------------------------------------------------------------------------- #
+# PullRequest dataclass + pr_list / pr_view / _parse_pr                        #
+# --------------------------------------------------------------------------- #
+
+
+_PR_JSON_LIST_PAYLOAD = [
+    {
+        "number": 7,
+        "title": "Add caching layer",
+        "body": "## Summary\nWIP",
+        "labels": [
+            {"id": "L1", "name": "ready-for-agent"},
+            {"id": "L2", "name": "enhancement"},
+        ],
+        "state": "OPEN",
+        "url": "https://github.com/x/y/pull/7",
+        "headRefOid": "f" * 40,
+        "headRefName": "feature/caching",
+    }
+]
+
+
+def test_pull_request_dataclass_default_comments_is_empty_tuple() -> None:
+    pr = PullRequest(
+        number=7,
+        title="t",
+        body="b",
+        labels=["x"],
+        state="OPEN",
+        url="https://example/pull/7",
+        head_sha="abc",
+        head_branch="feat",
+    )
+    assert pr.comments == ()
+    assert pr.head_sha == "abc"
+    assert pr.head_branch == "feat"
+
+
+def test_pr_list_happy_path(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run(cmd, **kw):
+        captured["cmd"] = cmd
+        return _completed(cmd, stdout=json.dumps(_PR_JSON_LIST_PAYLOAD))
+
+    _install_fake_run(monkeypatch, fake_run)
+    [pr] = pr_list("ready-for-agent")
+    assert pr.number == 7
+    assert pr.title == "Add caching layer"
+    assert pr.state == "OPEN"
+    assert pr.labels == ["ready-for-agent", "enhancement"]
+    assert pr.head_sha == "f" * 40
+    assert pr.head_branch == "feature/caching"
+    # pr_list MUST leave comments empty per docstring contract (mirrors issue_list).
+    assert pr.comments == ()
+    # argv shape: gh pr list --state open --label ... --json ...,headRefOid,headRefName
+    assert captured["cmd"][0] == "gh"
+    assert "pr" in captured["cmd"] and "list" in captured["cmd"]
+    assert "--label" in captured["cmd"] and "ready-for-agent" in captured["cmd"]
+    assert "--state" in captured["cmd"] and "open" in captured["cmd"]
+    json_arg = captured["cmd"][captured["cmd"].index("--json") + 1]
+    for f in (
+        "number",
+        "title",
+        "body",
+        "labels",
+        "state",
+        "url",
+        "headRefOid",
+        "headRefName",
+    ):
+        assert f in json_arg
+
+
+def test_pr_list_custom_state_arg_propagates(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run(cmd, **kw):
+        captured["cmd"] = cmd
+        return _completed(cmd, stdout="[]")
+
+    _install_fake_run(monkeypatch, fake_run)
+    pr_list("ready-for-agent", state="all")
+    assert "all" in captured["cmd"]
+
+
+def test_pr_list_empty_array_returns_empty_list(monkeypatch) -> None:
+    def fake_run(cmd, **kw):
+        return _completed(cmd, stdout="[]")
+
+    _install_fake_run(monkeypatch, fake_run)
+    assert pr_list("anything") == []
+
+
+def test_pr_list_non_array_payload_raises_gh_error(monkeypatch) -> None:
+    def fake_run(cmd, **kw):
+        return _completed(cmd, stdout=json.dumps({"oops": "object"}))
+
+    _install_fake_run(monkeypatch, fake_run)
+    with pytest.raises(GhError) as exc_info:
+        pr_list("anything")
+    assert "expected JSON array" in exc_info.value.stderr_tail
+
+
+def test_pr_view_happy_path_includes_comments_and_head(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+    payload = {
+        "number": 7,
+        "title": "Add caching layer",
+        "body": "## Summary\nWIP",
+        "labels": [{"name": "ready-for-agent"}],
+        "state": "OPEN",
+        "url": "https://github.com/x/y/pull/7",
+        "headRefOid": "a" * 40,
+        "headRefName": "feature/caching",
+        "comments": [
+            {
+                "author": {"login": "triage-bot"},
+                "body": "## Agent Brief\nDo X",
+                "createdAt": "2026-05-16T00:00:00Z",
+            }
+        ],
+    }
+
+    def fake_run(cmd, **kw):
+        captured["cmd"] = cmd
+        return _completed(cmd, stdout=json.dumps(payload))
+
+    _install_fake_run(monkeypatch, fake_run)
+    pr = pr_view(7)
+    assert pr.number == 7
+    assert pr.head_sha == "a" * 40
+    assert pr.head_branch == "feature/caching"
+    assert len(pr.comments) == 1
+    assert pr.comments[0].author == "triage-bot"
+    assert pr.comments[0].body.startswith("## Agent Brief")
+    # argv requests comments + head refs in one --json field.
+    json_arg = captured["cmd"][captured["cmd"].index("--json") + 1]
+    assert "comments" in json_arg and "headRefOid" in json_arg
+
+
+def test_pr_view_null_body_and_missing_head_normalised(monkeypatch) -> None:
+    payload = {
+        "number": 8,
+        "title": "t",
+        "body": None,
+        "labels": [],
+        "state": "OPEN",
+        "url": "u",
+        # headRefOid / headRefName absent → normalised to "".
+        "comments": [],
+    }
+
+    def fake_run(cmd, **kw):
+        return _completed(cmd, stdout=json.dumps(payload))
+
+    _install_fake_run(monkeypatch, fake_run)
+    pr = pr_view(8)
+    assert pr.body == ""
+    assert pr.head_sha == ""
+    assert pr.head_branch == ""
+
+
+def test_pr_view_nonzero_exit_raises_gh_error(monkeypatch) -> None:
+    def fake_run(cmd, **kw):
+        return _completed(cmd, code=1, stderr="no pull requests found\n")
+
+    _install_fake_run(monkeypatch, fake_run)
+    with pytest.raises(GhError) as exc_info:
+        pr_view(999)
+    assert exc_info.value.returncode == 1
+
+
+def test_parse_pr_non_dict_raises_gh_error() -> None:
+    with pytest.raises(GhError) as exc_info:
+        gh._parse_pr(["not", "a", "dict"], ["gh", "pr", "view"])
+    assert "expected JSON object for pull request" in exc_info.value.stderr_tail

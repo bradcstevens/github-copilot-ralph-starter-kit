@@ -417,8 +417,8 @@ class IterationSession:
             renderer=renderer,
             run_id=run_id,
             iter_num=3,
-            model="claude-opus-4.7-xhigh",
-            reasoning_effort="xhigh",
+            model="claude-opus-4.8",
+            reasoning_effort="max",
         ) as session:
             await session.send_and_wait(prompt)
 
@@ -441,15 +441,17 @@ class IterationSession:
         renderer: The :class:`Renderer` for live terminal output.
         run_id: 26-char ULID for the run.
         iter_num: 1-based iteration index.
-        model: Optional model override; forwarded to the SDK.
+        model: Optional model override; forwarded to the SDK. A bare base
+            model id (model id and reasoning effort are separate axes;
+            :mod:`ralph_afk.cli` strips any ``-<effort>`` suffix before
+            this point).
         reasoning_effort: Optional reasoning-effort override forwarded to
             the SDK as ``create_session(reasoning_effort=...)``. ``None``
             means *do not send* the ``reasoningEffort`` field — the
-            service then applies its own default. The loop derives the
-            default from the model id (see
-            :mod:`ralph_afk.cli`); load-bearing for model variants like
-            ``claude-opus-4.7-xhigh`` whose service-side default
-            (``medium``) is rejected by the model itself with a CAPI 400.
+            service then applies its own default. :mod:`ralph_afk.cli`
+            resolves and per-model-gates the value (a reasoning-incapable
+            model such as ``claude-haiku-4.5`` is sent ``None`` because
+            the CLI hard-rejects ``session.create`` otherwise).
     """
 
     def __init__(

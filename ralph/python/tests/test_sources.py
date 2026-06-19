@@ -19,6 +19,7 @@ from ralph_afk.sources import (
     IssueSource,
     PrdsIssueSource,
     is_afk_ready,
+    is_pr_afk_ready,
 )
 
 
@@ -736,6 +737,7 @@ class TestModuleStructure:
             "GitHubIssueSource",
             "PrdsIssueSource",
             "is_afk_ready",
+            "is_pr_afk_ready",
         }
         assert set(sources_module.__all__) == expected
         for name in expected:
@@ -807,3 +809,265 @@ class TestModuleStructure:
 
 # Silence pytest's unused-import warning if MagicMock ends up unused.
 _ = MagicMock
+
+
+# --------------------------------------------------------------------------- #
+# PR support helpers                                                          #
+# --------------------------------------------------------------------------- #
+
+
+def _make_pr(
+    number: int,
+    *,
+    body: str = "",
+    state: str = "OPEN",
+    head_sha: str = "a" * 40,
+    head_branch: str = "feature/x",
+    labels: list[str] | None = None,
+    comments: tuple[gh_module.Comment, ...] = (),
+) -> gh_module.PullRequest:
+    return gh_module.PullRequest(
+        number=number,
+        title=f"Test PR {number}",
+        body=body,
+        labels=labels if labels is not None else ["ready-for-agent"],
+        state=state,
+        url=f"https://github.com/x/y/pull/{number}",
+        head_sha=head_sha,
+        head_branch=head_branch,
+        comments=comments,
+    )
+
+
+def _brief_comment(body: str = "## Agent Brief\nDo the thing.") -> gh_module.Comment:
+    return gh_module.Comment(author="triage-bot", body=body, created_at="2026-05-16")
+
+
+# --------------------------------------------------------------------------- #
+# is_pr_afk_ready                                                             #
+# --------------------------------------------------------------------------- #
+
+
+class TestIsPrAfkReady:
+    def test_true_when_brief_in_body(self) -> None:
+        assert is_pr_afk_ready(_make_pr(7, body="## Agent Brief\nDo X")) is True
+
+    def test_true_when_brief_in_comment(self) -> None:
+        pr = _make_pr(7, body="normal description", comments=(_brief_comment(),))
+        assert is_pr_afk_ready(pr) is True
+
+    def test_false_when_no_brief_anywhere(self) -> None:
+        pr = _make_pr(
+            7,
+            body="normal",
+            comments=(gh_module.Comment("u", "lgtm", "2026-05-16"),),
+        )
+        assert is_pr_afk_ready(pr) is False
+
+    def test_false_when_brief_not_line_anchored(self) -> None:
+        assert is_pr_afk_ready(_make_pr(7, body="see ## Agent Brief inline")) is False
+
+    def test_false_for_empty_pr(self) -> None:
+        assert is_pr_afk_ready(_make_pr(7, body="")) is False
+
+
+# --------------------------------------------------------------------------- #
+# PR-aware AfkReadyItem / Completion shape                                    #
+# --------------------------------------------------------------------------- #
+
+
+class TestPrDataclassShapes:
+    def test_afk_ready_item_pr_kind_and_head_sha(self) -> None:
+        item = AfkReadyItem(
+            ref=7, title="t", rendered_block="x", kind="pr", head_sha="abc"
+        )
+        assert item.kind == "pr"
+        assert item.head_sha == "abc"
+
+    def test_afk_ready_item_defaults_to_issue_kind(self) -> None:
+        item = AfkReadyItem(ref=1, title="t", rendered_block="x")
+        assert item.kind == "issue"
+        assert item.head_sha == ""
+
+    def test_completion_defaults_to_issue_kind(self) -> None:
+        assert Completion(ref=1, sha="x").kind == "issue"
+
+    def test_completion_pr_kind(self) -> None:
+        assert Completion(ref=7, sha="newsha", kind="pr").kind == "pr"
+
+
+# --------------------------------------------------------------------------- #
+# GitHubIssueSource PR collection                                            #
+# --------------------------------------------------------------------------- #
+
+
+class TestGitHubCollectAfkReadyPrs:
+    def test_does_not_list_prs_when_include_prs_false(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        called = {"pr_list": 0}
+        monkeypatch.setattr(gh_module, "issue_list", lambda label, state="open": [])
+
+        def _pr_list(*_a: Any, **_kw: Any) -> list[gh_module.PullRequest]:
+            called["pr_list"] += 1
+            return []
+
+        monkeypatch.setattr(gh_module, "pr_list", _pr_list)
+        impl = GitHubIssueSource(_silent_logger())  # include_prs defaults False
+        assert impl.collect_afk_ready() == []
+        assert called["pr_list"] == 0
+
+    def test_collects_only_prs_with_brief_when_enabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gh_module, "issue_list", lambda label, state="open": [])
+        monkeypatch.setattr(
+            gh_module,
+            "pr_list",
+            lambda label, state="open": [_make_pr(7), _make_pr(8)],
+        )
+
+        def fake_pr_view(n: int) -> gh_module.PullRequest:
+            if n == 7:
+                return _make_pr(7, comments=(_brief_comment(),), head_sha="oldsha")
+            return _make_pr(8, body="no brief here")  # filtered out
+
+        monkeypatch.setattr(gh_module, "pr_view", fake_pr_view)
+        impl = GitHubIssueSource(_silent_logger(), include_prs=True)
+        items = impl.collect_afk_ready()
+
+        assert [i.ref for i in items] == [7]
+        assert items[0].kind == "pr"
+        assert items[0].head_sha == "oldsha"
+        assert items[0].rendered_block.startswith("=== PR #7:")
+        assert "(branch: feature/x)" in items[0].rendered_block
+
+    def test_pr_list_failure_is_non_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gh_module, "issue_list", lambda label, state="open": [])
+
+        def _raise(*_a: Any, **_kw: Any) -> list[gh_module.PullRequest]:
+            raise gh_module.GhError(["gh", "pr", "list"], 1, "boom")
+
+        monkeypatch.setattr(gh_module, "pr_list", _raise)
+        impl = GitHubIssueSource(_silent_logger(), include_prs=True)
+        assert impl.collect_afk_ready() == []
+
+
+# --------------------------------------------------------------------------- #
+# GitHubIssueSource PR-advance detection + mixed-pool backstop               #
+# --------------------------------------------------------------------------- #
+
+
+def _pool_pr(number: int = 7, head_sha: str = "oldsha") -> AfkReadyItem:
+    return AfkReadyItem(
+        ref=number, title="t", rendered_block="x", kind="pr", head_sha=head_sha
+    )
+
+
+class TestGitHubDetectPrAdvances:
+    def test_records_advance_when_head_sha_changed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            gh_module, "pr_view", lambda n: _make_pr(n, head_sha="newsha")
+        )
+        impl = GitHubIssueSource(_silent_logger(), include_prs=True)
+        completions = impl.handle_completions(pool=[_pool_pr()], new_commits=[])
+        assert len(completions) == 1
+        assert completions[0].ref == 7
+        assert completions[0].kind == "pr"
+        assert completions[0].sha == "newsha"
+
+    def test_no_advance_when_head_sha_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            gh_module, "pr_view", lambda n: _make_pr(n, head_sha="oldsha")
+        )
+        impl = GitHubIssueSource(_silent_logger(), include_prs=True)
+        assert (
+            impl.handle_completions(pool=[_pool_pr(head_sha="oldsha")], new_commits=[])
+            == []
+        )
+
+    def test_no_advance_when_pr_merged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            gh_module,
+            "pr_view",
+            lambda n: _make_pr(n, head_sha="newsha", state="MERGED"),
+        )
+        impl = GitHubIssueSource(_silent_logger(), include_prs=True)
+        assert impl.handle_completions(pool=[_pool_pr()], new_commits=[]) == []
+
+    def test_detection_skipped_when_include_prs_false(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        called = {"pr_view": 0}
+
+        def _pr_view(n: int) -> gh_module.PullRequest:
+            called["pr_view"] += 1
+            return _make_pr(n, head_sha="newsha")
+
+        monkeypatch.setattr(gh_module, "pr_view", _pr_view)
+        impl = GitHubIssueSource(_silent_logger())  # include_prs False
+        assert impl.handle_completions(pool=[_pool_pr()], new_commits=[]) == []
+        assert called["pr_view"] == 0
+
+    def test_pr_view_failure_during_detect_is_non_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def _raise(n: int) -> gh_module.PullRequest:
+            raise gh_module.GhError(["gh", "pr", "view", str(n)], 1, "boom")
+
+        monkeypatch.setattr(gh_module, "pr_view", _raise)
+        impl = GitHubIssueSource(_silent_logger(), include_prs=True)
+        assert impl.handle_completions(pool=[_pool_pr()], new_commits=[]) == []
+
+
+class TestGitHubMixedPoolBackstop:
+    def test_closes_keyword_never_closes_pr_sharing_number(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ``Closes #7`` must not ``gh issue close`` #7 when #7 is a PR."""
+        close_calls: list[int] = []
+        monkeypatch.setattr(gh_module, "issue_view", lambda n: _make_issue(n))
+        monkeypatch.setattr(
+            gh_module, "issue_close", lambda n, c: close_calls.append(n)
+        )
+        # PR-advance check: head unchanged → no PR completion either.
+        monkeypatch.setattr(
+            gh_module, "pr_view", lambda n: _make_pr(n, head_sha="oldsha")
+        )
+        impl = GitHubIssueSource(_silent_logger(), include_prs=True)
+        completions = impl.handle_completions(
+            pool=[_pool_pr(number=7, head_sha="oldsha")],
+            new_commits=[_FakeCommit("sha", "Closes #7")],
+        )
+        assert close_calls == []
+        assert completions == []
+
+    def test_issue_closure_still_works_with_pr_in_pool(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        close_calls: list[int] = []
+        monkeypatch.setattr(gh_module, "issue_view", lambda n: _make_issue(n))
+        monkeypatch.setattr(
+            gh_module, "issue_close", lambda n, c: close_calls.append(n)
+        )
+        monkeypatch.setattr(
+            gh_module, "pr_view", lambda n: _make_pr(n, head_sha="oldsha")
+        )
+        impl = GitHubIssueSource(_silent_logger(), include_prs=True)
+        completions = impl.handle_completions(
+            pool=[
+                _pool_pr(number=7, head_sha="oldsha"),
+                AfkReadyItem(ref=42, title="t", rendered_block="x"),  # issue
+            ],
+            new_commits=[_FakeCommit("sha", "Closes #42")],
+        )
+        assert close_calls == [42]
+        assert [c.ref for c in completions] == [42]

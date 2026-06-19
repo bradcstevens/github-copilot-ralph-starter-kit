@@ -8,7 +8,7 @@ A starter kit for running an **AFK (away-from-keyboard) AI coding loop** on top 
 
 This README is the **quickstart**. The deeper docs live under [`docs/`](docs/) — see [Where to go next](#where-to-go-next).
 
-> **Skills setup starts with `/setup-agent-skills`.** Once you've cloned this kit into your new project and installed the skills at the user level, the **first** thing to run in Copilot CLI is the [`/setup-agent-skills`](.copilot/skills/setup-agent-skills/SKILL.md) skill. It populates the `## Agent skills` block in your `AGENTS.md` and writes the per-repo `docs/agents/{issue-tracker,triage-labels,domain}.md` files that every downstream skill (`/to-issues`, `/triage`, `/to-prd`, `/diagnose`, `/tdd`, `/improve-codebase-architecture`, `/zoom-out`) reads. Skip this step and those skills will guess at your issue tracker, label vocabulary, and context layout. **Safety net:** if you forget, the bootstrap directive at the top of [`AGENTS.md`](templates/AGENTS.template.md) auto-invokes the skill on your next interactive `copilot` session, and the AFK runner ([`ralph/python/`](ralph/python/)) refuses to start without it. Full detail in [`docs/customization.md`](docs/customization.md#setup-agent-skills--the-entry-point-skill) and [`docs/customization.md` → Auto-bootstrap behavior](docs/customization.md#auto-bootstrap-behavior).
+> **Skills setup starts with `/setup-agent-skills`.** Once you've cloned this kit into your new project and installed the skills at the user level, the **first** thing to run in Copilot CLI is the [`/setup-agent-skills`](.copilot/skills/setup-agent-skills/SKILL.md) skill. It populates the `## Agent skills` block in your `AGENTS.md` and writes the per-repo `docs/agents/{issue-tracker,triage-labels,domain}.md` files that every downstream skill (`/to-issues`, `/triage`, `/to-prd`, `/diagnosing-bugs`, `/tdd`, `/improve-codebase-architecture`, `/zoom-out`) reads. Skip this step and those skills will guess at your issue tracker, label vocabulary, and context layout. **Safety net:** if you forget, the bootstrap directive at the top of [`AGENTS.md`](templates/AGENTS.template.md) auto-invokes the skill on your next interactive `copilot` session, and the AFK runner ([`ralph/python/`](ralph/python/)) refuses to start without it. Full detail in [`docs/customization.md`](docs/customization.md#setup-agent-skills--the-entry-point-skill) and [`docs/customization.md` → Auto-bootstrap behavior](docs/customization.md#auto-bootstrap-behavior).
 
 ---
 
@@ -51,7 +51,7 @@ cp -R .copilot/skills/* ~/.copilot/skills/
 #      - writes docs/agents/{issue-tracker,triage-labels,domain}.md — the per-repo
 #        config files every other skill reads to learn which issue tracker, label
 #        vocabulary, and context layout this project uses.
-#    Skip it and /to-issues, /triage, /to-prd, /diagnose, /tdd, and
+#    Skip it and /to-issues, /triage, /to-prd, /diagnosing-bugs, /tdd, and
 #    /improve-codebase-architecture will guess at the wrong defaults.
 copilot
 > /setup-agent-skills
@@ -83,7 +83,7 @@ These two steps are easy to conflate; they're not the same thing.
 
 | Step | Command | What it changes |
 | --- | --- | --- |
-| **Install skills at user level** | `cp -R .copilot/skills/* ~/.copilot/skills/` | Makes `/intake`, `/grill-me`, `/to-prd`, `/to-issues`, `/triage`, `/diagnose`, `/tdd`, `/improve-codebase-architecture`, `/zoom-out`, `/find-skills`, `/setup-agent-skills`, etc. discoverable in **any** Copilot CLI session on your machine. Run once per machine (or per kit upgrade). |
+| **Install skills at user level** | `cp -R .copilot/skills/* ~/.copilot/skills/` | Makes `/intake`, `/grill-me`, `/to-prd`, `/to-issues`, `/triage`, `/diagnosing-bugs`, `/tdd`, `/improve-codebase-architecture`, `/zoom-out`, `/find-skills`, `/setup-agent-skills`, etc. discoverable in **any** Copilot CLI session on your machine. Run once per machine (or per kit upgrade). |
 | **Configure skills for this repo** | `/setup-agent-skills` (inside `copilot`) | Edits **this repo's** `AGENTS.md` `## Agent skills` block and writes **this repo's** `docs/agents/*.md`. Tells the other skills which issue tracker (GitHub / GitLab / local markdown / other), which label vocabulary, and which context layout (single vs multi-context) this project uses. Run once per repo. |
 
 The first is a one-time machine-level install. The second is a one-time per-project configuration that **must** run before any of the other planning/implementation skills.

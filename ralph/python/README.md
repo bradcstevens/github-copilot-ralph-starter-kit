@@ -46,7 +46,7 @@ the cached environment under `ralph/python/.venv/`.
 ## Invocation
 
 ```bash
-# Unlimited iterations, default model (claude-opus-4.7-xhigh).
+# Unlimited iterations, default model (claude-opus-4.8 at `max` reasoning effort).
 uv run --project ralph/python ralph-afk
 
 # Cap at 50 iterations.
@@ -88,8 +88,8 @@ surface including verbosity flags (`-v`, `-vv`, `-vvv`) and
 
 | Env var                           | Default                        | Notes                                                                                                                                                                                                            |
 | --------------------------------- | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MODEL`                           | `claude-opus-4.7-xhigh`        | Copilot CLI model id.                                                                                                                                                                                            |
-| `REASONING_EFFORT`                | auto-derived from `MODEL`      | One of `low` / `medium` / `high` / `xhigh`. Unset → derived from the trailing `-<effort>` segment of the model id (e.g. `claude-opus-4.7-xhigh` → `xhigh`), so the kit's default model avoids a CAPI 400 reject. |
+| `MODEL`                           | `claude-opus-4.8`              | Copilot CLI model id. Use a **bare base id** — model id and reasoning effort are separate axes (a suffixed id like `claude-opus-4.7-xhigh` is rejected as "not available"). A recognised trailing `-<effort>` segment is peeled off into `REASONING_EFFORT` for backward compatibility.                                                                                                                                                                                            |
+| `REASONING_EFFORT`                | `max` (kit default model only) | One of `low` / `medium` / `high` / `xhigh` / `max`. Precedence: this env var (validated; an invalid value aborts exit `1`) → a `-<effort>` suffix on `MODEL` → the kit default (`max`, applied only when `MODEL` is unset) → unset. A reasoning-incapable model (`claude-opus-4.5`, `claude-sonnet-4.5`, `claude-haiku-4.5`) forces this to **unset** (the CLI hard-rejects `session.create` otherwise); an unknown model warns and passes the value through to the CLI. |
 | `ISSUE_SOURCE`                    | `github`                       | `github` or `prds`. `prds` walks `prds/<feature>/NNN-*.md` files.                                                                                                                                                |
 | `MAX_NMT_STRIKES`                 | `3`                            | Consecutive no-progress iterations before aborting exit `1`. Integer ≥ 1.                                                                                                                                        |
 | `RALPH_DENY_TOOLS`                | _(empty)_                      | Comma-separated tool denylist. **Unioned** with `--deny-tool` CLI flags — CLI does NOT override env (security-positive divergence).                                                                              |
@@ -102,6 +102,40 @@ surface including verbosity flags (`-v`, `-vv`, `-vvv`) and
 CLI flags (`-v` / `-vv` / `-vvv`, `--no-reasoning`, `--deny-tool`,
 `--deny-skill`) are the runner's only non-positional flags. See
 `ralph-afk --help` for the full list.
+
+---
+
+## Supported models
+
+`MODEL` accepts any id the Copilot CLI exposes, but the runner ships a
+capability matrix (`ralph_afk/config.py` → `MODEL_REASONING_EFFORTS`)
+that gates `REASONING_EFFORT` per model. A model not in this table is
+**warned** about once and passed through unchanged (the CLI is the final
+authority). A model with an empty effort set is sent **no** reasoning
+effort — the CLI hard-rejects `session.create` otherwise.
+
+| Model id                    | Reasoning efforts                 |
+| --------------------------- | --------------------------------- |
+| `claude-opus-4.8` (default) | `low` `medium` `high` `xhigh` `max` |
+| `claude-opus-4.7`           | `low` `medium` `high` `xhigh` `max` |
+| `claude-opus-4.6`           | `low` `medium` `high` `max`       |
+| `claude-opus-4.5`           | _(none — effort forced unset)_    |
+| `claude-sonnet-4.6`         | `low` `medium` `high` `max`       |
+| `claude-sonnet-4.5`         | _(none — effort forced unset)_    |
+| `claude-haiku-4.5`          | _(none — effort forced unset)_    |
+| `gpt-5.5`                   | `low` `medium` `high` `xhigh`     |
+| `gpt-5.4`                   | `low` `medium` `high` `xhigh`     |
+| `gpt-5.3-codex`             | `low` `medium` `high` `xhigh`     |
+| `gpt-5.4-mini`              | `low` `medium` `high` `xhigh`     |
+| `gpt-5-mini`                | `low` `medium` `high`             |
+| `gemini-3.1-pro-preview`    | `low` `medium` `high`             |
+| `gemini-3.5-flash`          | `low` `medium` `high`             |
+| `mai-code-1-flash-internal` | `low` `medium` `high`             |
+
+A subset of these carry list prices in the packaged `pricing.toml`
+(`claude-opus-4.8`, `claude-opus-4.7`, `claude-sonnet-4.6`, `gpt-5.4`,
+`gpt-5-mini`); any other model runs unpriced and renders `—` in the cost
+column rather than a fabricated estimate.
 
 ---
 

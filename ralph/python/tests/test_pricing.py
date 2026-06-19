@@ -39,9 +39,9 @@ from ralph_afk.pricing import (
 
 
 def test_load_pricing_packaged_default_contains_kit_default_model():
-    """The packaged pricing.toml must include ``claude-opus-4.7-xhigh``."""
+    """The packaged pricing.toml must include ``claude-opus-4.8``."""
     p = load_pricing()
-    assert "claude-opus-4.7-xhigh" in p.models
+    assert "claude-opus-4.8" in p.models
 
 
 def test_load_pricing_packaged_default_has_at_least_three_models():
@@ -105,7 +105,7 @@ def test_load_pricing_env_var_empty_string_falls_through_to_packaged(
     """An unset env var is conventional in tests; verify empty-string behaves the same."""
     monkeypatch.setenv("RALPH_PRICING_FILE", "")
     p = load_pricing()
-    assert "claude-opus-4.7-xhigh" in p.models
+    assert "claude-opus-4.8" in p.models
 
 
 def test_load_pricing_malformed_toml_raises_with_path(tmp_path: Path) -> None:
@@ -344,7 +344,7 @@ def test_packaged_pricing_kit_default_model_has_realistic_values() -> None:
     trips this without requiring a brittle exact-value match against drifting list prices.
     """
     p = load_pricing()
-    m = p.models["claude-opus-4.7-xhigh"]
+    m = p.models["claude-opus-4.8"]
     assert Decimal("0.01") < m.input_per_mtok < Decimal("1000")
     assert Decimal("0.01") < m.output_per_mtok < Decimal("1000")
     # Universally true for current LLM provider list pricing.

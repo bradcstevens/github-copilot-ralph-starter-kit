@@ -58,6 +58,7 @@ from ralph_afk.events import (
     WRAPPER_COMMIT_RECORDED,
     WRAPPER_ITERATION_END,
     WRAPPER_ITERATION_START,
+    WRAPPER_PR_ADVANCED,
     WRAPPER_RUN_END,
     WRAPPER_RUN_START,
     WRAPPER_STALE_WORKTREE_ABORTED,
@@ -292,6 +293,23 @@ class Renderer:
         self.console.print(text)
         self.summary.record_auto_close()
 
+    def _on_pr_advanced(self, event: dict[str, Any]) -> None:
+        pr = event.get("pr")
+        sha = event.get("sha", "")
+        short = sha[:10] if isinstance(sha, str) else ""
+        text = Text()
+        text.append("↑ ", style=STYLES["success"])
+        text.append("advanced PR ", style=STYLES["meta"])
+        if pr is not None:
+            text.append(f"#{pr}", style=STYLES["success"])
+        if short:
+            text.append(f"  ({short})", style=STYLES["meta"])
+        self.console.print(text)
+        # PR advances count as wrapper-side completions for progress display,
+        # sharing the auto-close tally (the loop already counts them toward
+        # iteration progress alongside issue closures).
+        self.summary.record_auto_close()
+
     def _on_strike(self, event: dict[str, Any]) -> None:
         strikes_raw = event.get("strikes")
         max_strikes = event.get("max_strikes")
@@ -510,6 +528,7 @@ _HANDLERS: dict[str, Callable[[Renderer, dict[str, Any]], None]] = {
     WRAPPER_STALE_WORKTREE_ABORTED: Renderer._on_stale_worktree_aborted,
     WRAPPER_COMMIT_RECORDED: Renderer._on_commit_recorded,
     WRAPPER_AUTO_CLOSE: Renderer._on_auto_close,
+    WRAPPER_PR_ADVANCED: Renderer._on_pr_advanced,
     WRAPPER_STRIKE: Renderer._on_strike,
     WRAPPER_ASK_USER_ATTEMPTED: Renderer._on_ask_user_attempted,
     ASSISTANT_REASONING: Renderer._on_assistant_reasoning,

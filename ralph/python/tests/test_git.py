@@ -24,11 +24,13 @@ from ralph_afk.git import (
     Commit,
     GitError,
     commits_between,
+    current_branch,
     head_sha,
     is_dirty,
     range_count,
     recent_commits,
     repo_root,
+    switch,
 )
 
 # --------------------------------------------------------------------------- #
@@ -411,3 +413,49 @@ def test_git_error_carries_command_returncode_stderr_tail() -> None:
     assert e.returncode == 2
     assert "fatal: not a git repository" in e.stderr_tail
     assert "git diff --quiet" in str(e)
+
+
+# --------------------------------------------------------------------------- #
+# current_branch / switch                                                     #
+# --------------------------------------------------------------------------- #
+
+
+def test_current_branch_returns_named_branch(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    _commit(tmp_path, "init")
+    assert current_branch(tmp_path) == "main"
+
+
+def test_current_branch_returns_none_on_detached_head(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    sha = _commit(tmp_path, "init")
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "checkout", "-q", sha],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert current_branch(tmp_path) is None
+
+
+def test_switch_checks_out_existing_branch(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    _commit(tmp_path, "init")
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "branch", "feature/x"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    switch("feature/x", tmp_path)
+    assert current_branch(tmp_path) == "feature/x"
+    # Round-trip back to base.
+    switch("main", tmp_path)
+    assert current_branch(tmp_path) == "main"
+
+
+def test_switch_raises_for_missing_branch(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    _commit(tmp_path, "init")
+    with pytest.raises(GitError):
+        switch("does-not-exist", tmp_path)

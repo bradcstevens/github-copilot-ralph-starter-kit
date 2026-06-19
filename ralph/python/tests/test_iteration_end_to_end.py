@@ -1220,3 +1220,169 @@ def test_loop_emits_otel_span_tree_when_enabled(tmp_path, monkeypatch) -> None:
     # `issues` is stored as a tuple/list of ints — OTel normalises to
     # a sequence.
     assert list(issues_attr) == [42], f"issues attr: {issues_attr!r}"
+
+
+# ---------------------------------------------------------------------------
+# PR-advance integration test (include_prs=True)
+# ---------------------------------------------------------------------------
+
+
+def _make_pr_view(
+    number: int,
+    *,
+    head_sha: str,
+    state: str = "OPEN",
+    head_branch: str = "feature/pr-work",
+    comments: tuple[gh_module.Comment, ...] = (),
+) -> gh_module.PullRequest:
+    return gh_module.PullRequest(
+        number=number,
+        title=f"Test PR {number}",
+        body="",
+        labels=["ready-for-agent"],
+        state=state,
+        url=f"https://github.com/x/y/pull/{number}",
+        head_sha=head_sha,
+        head_branch=head_branch,
+        comments=comments,
+    )
+
+
+def test_loop_pr_advance_emits_pr_advanced_event(tmp_path, monkeypatch) -> None:
+    """With include_prs=True, a PR whose head SHA advances emits wrapper.pr.advanced.
+
+    No base-branch commit lands (PR work happens on the PR branch), so the
+    only progress signal is the head-SHA advance. Asserts:
+
+    * exit 0,
+    * the PR block reaches the prompt,
+    * ``wrapper.pr.advanced`` is logged and ``wrapper.auto_close`` is not,
+    * the iteration row counts the advance as an auto-closure (progress),
+      with 0 commits and 0 strikes,
+    * the base branch is never switched (HEAD already on base).
+    """
+    # -- repo on disk -----------------------------------------------------
+    (tmp_path / "ralph").mkdir()
+    (tmp_path / "ralph" / "prompt.md").write_text(
+        "You are ralph. Advance the AFK-ready PRs.\n", encoding="utf-8"
+    )
+    (tmp_path / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+
+    # -- git stubs --------------------------------------------------------
+    monkeypatch.setattr(git_module, "repo_root", lambda start=None: tmp_path)
+    monkeypatch.setattr(git_module, "is_dirty", lambda start=None: False)
+    # Head SHA constant: no base-branch commit this iteration.
+    monkeypatch.setattr(git_module, "head_sha", lambda start=None: "base-sha")
+    monkeypatch.setattr(
+        git_module, "commits_between", lambda pre, head, start=None: []
+    )
+    monkeypatch.setattr(git_module, "recent_commits", lambda n, start=None: [])
+    # HEAD is on the base branch the whole time → no restore needed.
+    monkeypatch.setattr(git_module, "current_branch", lambda start=None: "main")
+    switch_calls: list[str] = []
+    monkeypatch.setattr(
+        git_module, "switch", lambda branch, start=None: switch_calls.append(branch)
+    )
+
+    # -- gh stubs ---------------------------------------------------------
+    monkeypatch.setattr(gh_module, "auth_status", lambda: True)
+    monkeypatch.setattr(
+        gh_module,
+        "repo_view",
+        lambda: gh_module.Repo(owner="x", name="y", default_branch="main"),
+    )
+    monkeypatch.setattr(gh_module, "issue_list", lambda label, state="open": [])
+    monkeypatch.setattr(
+        gh_module,
+        "pr_list",
+        lambda label, state="open": [
+            _make_pr_view(7, head_sha="prsha-old")
+        ],
+    )
+
+    brief = gh_module.Comment(
+        author="triage-bot",
+        body="## Agent Brief\nFinish the caching change.",
+        created_at="2026-05-16T00:00:00Z",
+    )
+    pr_view_calls = {"n": 0}
+
+    def fake_pr_view(number: int) -> gh_module.PullRequest:
+        pr_view_calls["n"] += 1
+        # 1st call = collection (old head + brief); 2nd = advance check (new head).
+        if pr_view_calls["n"] == 1:
+            return _make_pr_view(number, head_sha="prsha-old", comments=(brief,))
+        return _make_pr_view(number, head_sha="prsha-new", comments=(brief,))
+
+    monkeypatch.setattr(gh_module, "pr_view", fake_pr_view)
+
+    # -- SDK stub ---------------------------------------------------------
+    scripted = [
+        _sdk_event(
+            SessionEventType.TOOL_EXECUTION_START,
+            ToolExecutionStartData(
+                tool_call_id="call-1",
+                tool_name="edit",
+                arguments={"path": "cache.py"},
+            ),
+        ),
+        _sdk_event(
+            SessionEventType.ASSISTANT_MESSAGE,
+            AssistantMessageData(content="Advancing PR #7.", message_id="m1"),
+        ),
+        _sdk_event(
+            SessionEventType.ASSISTANT_USAGE,
+            AssistantUsageData(
+                input_tokens=100, output_tokens=50, model="claude-opus-4.7-xhigh"
+            ),
+        ),
+    ]
+    fake_client = FakeCopilotClient(scripted_events=scripted)
+    monkeypatch.setattr(loop_module, "_make_client", lambda: fake_client)
+
+    # -- run --------------------------------------------------------------
+    cfg = RunConfig(
+        model="claude-opus-4.7-xhigh",
+        issue_source="github",
+        include_prs=True,
+        max_iterations=1,
+        max_nmt_strikes=3,
+        verbosity=0,
+        render_reasoning=False,
+    )
+    exit_code = asyncio.run(loop_module.run(cfg))
+
+    # -- assertions -------------------------------------------------------
+    assert exit_code == 0, f"expected exit 0, got {exit_code}"
+    assert switch_calls == [], "base branch must not be switched when HEAD is on base"
+
+    # PR block reached the prompt.
+    sdk_session = fake_client.created[0]
+    prompt, _timeout = sdk_session.send_and_wait_calls[0]
+    assert "PR #7" in prompt
+    assert "(branch: feature/pr-work)" in prompt
+
+    # Event log: pr.advanced present, auto_close absent.
+    jsonl_files = list((tmp_path / ".ralph" / "logs").glob("*.jsonl"))
+    assert len(jsonl_files) == 1
+    types_seen: list[str] = []
+    pr_advanced_payloads: list[dict[str, Any]] = []
+    for raw in jsonl_files[0].read_text(encoding="utf-8").splitlines():
+        evt = json.loads(raw)
+        types_seen.append(evt["type"])
+        if evt["type"] == "wrapper.pr.advanced":
+            pr_advanced_payloads.append(evt)
+    assert "wrapper.pr.advanced" in types_seen, f"saw: {types_seen}"
+    assert "wrapper.auto_close" not in types_seen, f"saw: {types_seen}"
+    assert "wrapper.commit.recorded" not in types_seen, (
+        "no base-branch commit landed this iteration"
+    )
+    assert pr_advanced_payloads[0].get("pr") == 7
+
+    # Run-summary: the advance counts as progress (auto_closure), 0 commits, 0 strikes.
+    json_files = list((tmp_path / ".ralph" / "runs").glob("*.json"))
+    payload = json.loads(json_files[0].read_text(encoding="utf-8"))
+    iter_row = payload["iterations"][0]
+    assert iter_row["commits"] == 0
+    assert iter_row["auto_closures"] == 1
+    assert iter_row["strikes"] == 0

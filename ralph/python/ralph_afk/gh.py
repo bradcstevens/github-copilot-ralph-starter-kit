@@ -21,6 +21,14 @@ Public surface:
 * :func:`issue_close` — close an issue with a wrap-up comment **and verify**
   the close landed (raises :exc:`GhError` if the post-close state is not
   ``CLOSED``).
+* :class:`PullRequest` — frozen value object for a pull request, carrying
+  ``head_sha`` (``headRefOid``) and ``head_branch`` (``headRefName``) so the
+  loop can detect a PR-branch advance by SHA without a local checkout.
+* :func:`pr_list` — list PRs filtered by label and state (``comments`` left
+  empty, mirroring :func:`issue_list`).
+* :func:`pr_view` — full single-PR view including ``comments``. The wrapper
+  **never** closes or merges a PR (humans merge in QA), so there is no
+  ``pr_close`` counterpart to :func:`issue_close`.
 
 Design notes:
 
@@ -47,11 +55,14 @@ __all__ = [
     "Repo",
     "Comment",
     "Issue",
+    "PullRequest",
     "auth_status",
     "repo_view",
     "issue_list",
     "issue_view",
     "issue_close",
+    "pr_list",
+    "pr_view",
 ]
 
 _GH_BIN: Final[str] = "gh"
@@ -152,6 +163,42 @@ class Issue:
     comments: tuple[Comment, ...] = field(default=())
 
 
+@dataclass(frozen=True)
+class PullRequest:
+    """A GitHub pull request.
+
+    Mirrors :class:`Issue` but adds the two head-ref fields the AFK loop
+    needs to detect progress on a PR without checking it out locally:
+
+    Attributes:
+        number: PR number. Shares GitHub's per-repo number space with
+            issues, so a PR and an issue never collide on ``number``.
+        title: PR title.
+        body: Raw markdown body (``""`` when empty).
+        labels: Label names attached to the PR, in ``gh`` order.
+        state: ``"OPEN"`` / ``"CLOSED"`` / ``"MERGED"`` (upper-case, as
+            ``gh`` returns it).
+        url: Canonical https URL to the PR.
+        head_sha: The PR head commit SHA (``headRefOid``). The loop captures
+            this at collection time and re-reads it after the iteration; a
+            change means the agent pushed to the PR branch — i.e. progress —
+            even though no commit landed on the base branch locally.
+        head_branch: The PR head branch name (``headRefName``) — the branch
+            ``gh pr checkout <number>`` puts you on.
+        comments: Tuple of :class:`Comment`, only populated by :func:`pr_view`.
+    """
+
+    number: int
+    title: str
+    body: str
+    labels: list[str]
+    state: str
+    url: str
+    head_sha: str
+    head_branch: str
+    comments: tuple[Comment, ...] = field(default=())
+
+
 def _run(args: Sequence[str], *, check: bool = True) -> str:
     """Invoke ``gh <args>`` and return stdout.
 
@@ -248,6 +295,55 @@ def _parse_issue(data: object, cmd: Sequence[str]) -> Issue:
     except (KeyError, TypeError, ValueError) as exc:
         raise GhError(
             cmd, 0, f"gh issue JSON missing or malformed field: {exc}"
+        ) from exc
+
+
+def _parse_pr(data: object, cmd: Sequence[str]) -> PullRequest:
+    """Convert one ``gh`` pull-request JSON object into a :class:`PullRequest`.
+
+    Parallels :func:`_parse_issue` (same defensive contract: any unexpected
+    shape becomes a :exc:`GhError`) but also reads ``headRefOid`` /
+    ``headRefName`` into ``head_sha`` / ``head_branch``.
+    """
+    if not isinstance(data, dict):
+        raise GhError(
+            cmd,
+            0,
+            f"expected JSON object for pull request, got {type(data).__name__}",
+        )
+    try:
+        labels_raw = data.get("labels") or []
+        labels: list[str] = []
+        for lab in labels_raw:
+            if isinstance(lab, dict) and "name" in lab:
+                labels.append(str(lab["name"]))
+        comments_raw = data.get("comments") or []
+        comments: list[Comment] = []
+        for c in comments_raw:
+            if not isinstance(c, dict):
+                continue
+            author = (c.get("author") or {}).get("login") or ""
+            comments.append(
+                Comment(
+                    author=str(author),
+                    body=str(c.get("body") or ""),
+                    created_at=str(c.get("createdAt") or ""),
+                )
+            )
+        return PullRequest(
+            number=int(data["number"]),
+            title=str(data["title"]),
+            body=str(data.get("body") or ""),
+            labels=labels,
+            state=str(data["state"]),
+            url=str(data["url"]),
+            head_sha=str(data.get("headRefOid") or ""),
+            head_branch=str(data.get("headRefName") or ""),
+            comments=tuple(comments),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise GhError(
+            cmd, 0, f"gh pull request JSON missing or malformed field: {exc}"
         ) from exc
 
 
@@ -416,3 +512,71 @@ def _issue_state(number: int) -> str:
             f"gh issue view #{number} state JSON malformed: {parsed!r}",
         )
     return str(parsed["state"])
+
+
+def pr_list(label: str, state: str = "open") -> list[PullRequest]:
+    """List pull requests filtered by label and state.
+
+    The PR-surface analogue of :func:`issue_list`. Used by the AFK loop only
+    when PR support is enabled (see :class:`ralph_afk.sources.GitHubIssueSource`).
+
+    Args:
+        label: A single label name (matches ``gh``'s single ``--label`` flag).
+        state: ``"open"`` (default), ``"closed"``, ``"merged"``, or ``"all"`` —
+            passed verbatim to ``gh pr list --state``.
+
+    Returns:
+        A list of :class:`PullRequest` with ``comments`` always empty
+        (mirroring :func:`issue_list`); the loop enriches per-PR via
+        :func:`pr_view` only for candidates it actually feeds the agent.
+
+    Raises:
+        GhError: On any subprocess or parse failure.
+    """
+    cmd = [
+        "pr",
+        "list",
+        "--state",
+        state,
+        "--label",
+        label,
+        "--limit",
+        "100",
+        "--json",
+        "number,title,body,labels,state,url,headRefOid,headRefName",
+    ]
+    raw = _run(cmd)
+    parsed = _parse_json(raw, [_GH_BIN, *cmd])
+    if not isinstance(parsed, list):
+        raise GhError(
+            [_GH_BIN, *cmd],
+            0,
+            f"expected JSON array from gh pr list, got {type(parsed).__name__}",
+        )
+    return [_parse_pr(item, [_GH_BIN, *cmd]) for item in parsed]
+
+
+def pr_view(number: int) -> PullRequest:
+    """Fetch one pull request including its comments and head-ref fields.
+
+    Args:
+        number: PR number.
+
+    Returns:
+        The :class:`PullRequest` with ``comments`` populated and a fresh
+        ``head_sha`` — the loop re-reads this after an iteration to decide
+        whether the PR branch advanced.
+
+    Raises:
+        GhError: On any subprocess or parse failure (e.g. PR not found).
+    """
+    cmd = [
+        "pr",
+        "view",
+        str(number),
+        "--json",
+        "number,title,body,labels,state,url,headRefOid,headRefName,comments",
+    ]
+    raw = _run(cmd)
+    parsed = _parse_json(raw, [_GH_BIN, *cmd])
+    return _parse_pr(parsed, [_GH_BIN, *cmd])

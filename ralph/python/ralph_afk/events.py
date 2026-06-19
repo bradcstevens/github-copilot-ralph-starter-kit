@@ -70,6 +70,7 @@ __all__ = [
     "WRAPPER_STALE_WORKTREE_ABORTED",
     "WRAPPER_COMMIT_RECORDED",
     "WRAPPER_AUTO_CLOSE",
+    "WRAPPER_PR_ADVANCED",
     "WRAPPER_STRIKE",
     "WRAPPER_ASK_USER_ATTEMPTED",
     # SDK-mapped event-type constants
@@ -106,6 +107,7 @@ WRAPPER_AFK_READY_COLLECTED = "wrapper.afk_ready.collected"
 WRAPPER_STALE_WORKTREE_ABORTED = "wrapper.stale_worktree.aborted"
 WRAPPER_COMMIT_RECORDED = "wrapper.commit.recorded"
 WRAPPER_AUTO_CLOSE = "wrapper.auto_close"
+WRAPPER_PR_ADVANCED = "wrapper.pr.advanced"
 WRAPPER_STRIKE = "wrapper.strike"
 WRAPPER_ASK_USER_ATTEMPTED = "wrapper.ask_user.attempted"
 

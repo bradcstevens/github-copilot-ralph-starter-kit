@@ -84,6 +84,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Iterable
@@ -159,6 +160,8 @@ def _make_issue_source(
     config: RunConfig,
     repo_root: Path,
     diag: logging.Logger,
+    *,
+    include_prs: bool = False,
 ) -> IssueSource:
     """Construct the per-invocation :class:`IssueSource`.
 
@@ -166,6 +169,14 @@ def _make_issue_source(
     scope so tests can monkeypatch it for end-to-end fakes. Returns a
     :class:`GitHubIssueSource` for ``"github"`` and a
     :class:`PrdsIssueSource` for ``"prds"``.
+
+    Args:
+        config: The frozen run configuration.
+        repo_root: The resolved repository root (used by the PRDs backend).
+        diag: Diagnostics logger handed to the source.
+        include_prs: Whether the GitHub backend should also collect
+            ``ready-for-agent`` PRs (see :func:`_resolve_include_prs`). The
+            PRDs backend ignores it — local-markdown has no PRs.
 
     Raises:
         ValueError: If ``config.issue_source`` is neither known value.
@@ -175,13 +186,49 @@ def _make_issue_source(
             branch here.
     """
     if config.issue_source == "github":
-        return GitHubIssueSource(diag)
+        return GitHubIssueSource(diag, include_prs=include_prs)
     if config.issue_source == "prds":
         return PrdsIssueSource(repo_root, diag)
     raise ValueError(
         f"unknown issue_source {config.issue_source!r}; expected "
         f"'github' or 'prds'"
     )
+
+
+# Matches the PR-surface flag ``/setup-agent-skills`` writes into
+# ``docs/agents/issue-tracker.md`` — e.g. ``**PRs as a request surface: yes.**``.
+_RE_PR_SURFACE: re.Pattern[str] = re.compile(
+    r"PRs as a request surface:\s*(yes|no)", re.IGNORECASE
+)
+
+
+def _resolve_include_prs(config: RunConfig, repo_root: Path) -> bool:
+    """Resolve whether ``ready-for-agent`` PRs join the AFK-ready pool.
+
+    Precedence:
+
+    1. :attr:`RunConfig.include_prs` when not ``None`` — the ``INCLUDE_PRS``
+       env override resolved by the CLI.
+    2. Otherwise auto-detect from ``docs/agents/issue-tracker.md``: PRs are
+       included only when it carries ``PRs as a request surface: yes`` (the
+       exact flag ``/setup-agent-skills`` writes and ``/triage`` reads).
+    3. ``False`` when the file is missing or the flag is absent / ``no`` — so
+       PR support stays off unless a repo has explicitly opted in.
+
+    Only ``issue_source == "github"`` can collect PRs; for ``"prds"`` the
+    flag is meaningless (the factory hands it a PRDs source that ignores it).
+    """
+    if config.include_prs is not None:
+        return config.include_prs
+    tracker = repo_root / "docs" / "agents" / "issue-tracker.md"
+    try:
+        text = tracker.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    match = _RE_PR_SURFACE.search(text)
+    if match is None:
+        return False
+    return match.group(1).lower() == "yes"
 
 
 def _send_timeout_seconds() -> float:
@@ -256,6 +303,7 @@ class _Loop:
         client: CopilotClient,
         source: IssueSource,
         diag: logging.Logger,
+        include_prs: bool = False,
     ) -> None:
         self._config = config
         self._repo_root = repo_root
@@ -267,6 +315,11 @@ class _Loop:
         self._client = client
         self._source = source
         self._diag = diag
+        self._include_prs = include_prs
+        # Base branch to restore to after a PR iteration (captured in
+        # ``drive`` only when PRs are in scope). ``None`` = unknown / detached
+        # HEAD, which disables the defensive restore.
+        self._base_branch: str | None = None
         self._strike_machine = NMTStrikeStateMachine(
             max_strikes=config.max_nmt_strikes
         )
@@ -342,6 +395,40 @@ class _Loop:
                 self._emit(events_module.WRAPPER_ITERATION_END, iter_num=iter_num)
                 self._record_counters(iter_num)
                 return ("stale_worktree", 0, 0)
+
+            # 1b) PR branch hygiene. A prior PR iteration may have run
+            #     `gh pr checkout <N>` and left HEAD on the PR branch. The
+            #     worktree is clean (the guard above just passed), so restore
+            #     the captured base branch — otherwise this iteration's
+            #     commits and `commits_between` accounting would land on the
+            #     PR branch. Gated on `include_prs` so the default (issues-only)
+            #     path is byte-for-byte unchanged and never touches branches.
+            if self._include_prs and self._base_branch is not None:
+                try:
+                    on_branch = git_module.current_branch(self._repo_root)
+                except git_module.GitError as exc:
+                    self._diag.warning(
+                        "current_branch check failed: %s; skipping base "
+                        "restore",
+                        exc,
+                    )
+                    on_branch = None
+                if on_branch is not None and on_branch != self._base_branch:
+                    try:
+                        git_module.switch(self._base_branch, self._repo_root)
+                        self._diag.info(
+                            "restored base branch %s (iteration started on %s)",
+                            self._base_branch,
+                            on_branch,
+                        )
+                    except git_module.GitError as exc:
+                        self._diag.warning(
+                            "could not restore base branch %s: %s; "
+                            "continuing on %s",
+                            self._base_branch,
+                            exc,
+                            on_branch,
+                        )
 
             # 2) Collect AFK-ready pool via the source.
             with telemetry.span("ralph_afk.collect_issues"):
@@ -465,13 +552,25 @@ class _Loop:
             with telemetry.span("ralph_afk.enforce_closures"):
                 completions = self._handle_completions_safely(pool, new_commits)
             for completion in completions:
-                self._emit(
-                    events_module.WRAPPER_AUTO_CLOSE,
-                    iter_num=iter_num,
-                    issue=completion.ref,
-                    sha=completion.sha,
-                    shas=list(completion.shas),
-                )
+                if getattr(completion, "kind", "issue") == "pr":
+                    # A PR advance (head SHA moved). Different event so the
+                    # renderer says "advanced PR #N" rather than
+                    # "auto-closed #N"; still counted toward progress below.
+                    self._emit(
+                        events_module.WRAPPER_PR_ADVANCED,
+                        iter_num=iter_num,
+                        pr=completion.ref,
+                        sha=completion.sha,
+                        shas=list(completion.shas),
+                    )
+                else:
+                    self._emit(
+                        events_module.WRAPPER_AUTO_CLOSE,
+                        iter_num=iter_num,
+                        issue=completion.ref,
+                        sha=completion.sha,
+                        shas=list(completion.shas),
+                    )
             auto_closures = len(completions)
 
             # 8) Strike state machine + emit appropriate events.
@@ -568,6 +667,20 @@ class _Loop:
         rc = self._source.preflight()
         if rc is not None:
             return rc
+
+        # Capture the base branch once, before any iteration can run
+        # `gh pr checkout`, so PR iterations can return to it (see the
+        # branch-hygiene step in `_run_one_iteration`). Only when PRs are in
+        # scope; a detached HEAD or git failure leaves it None, which simply
+        # disables the defensive restore.
+        if self._include_prs:
+            try:
+                self._base_branch = git_module.current_branch(self._repo_root)
+            except git_module.GitError as exc:
+                self._diag.warning(
+                    "could not determine base branch for PR restore: %s", exc
+                )
+                self._base_branch = None
 
         self._emit(
             events_module.WRAPPER_RUN_START,
@@ -703,8 +816,11 @@ async def run(config: RunConfig) -> int:
     #    ValueError here means the config carried a value the loop
     #    doesn't recognise — surface a clean exit 1 rather than letting
     #    the exception escape.
+    include_prs = _resolve_include_prs(config, repo_root)
     try:
-        source = _make_issue_source(config, repo_root, diag)
+        source = _make_issue_source(
+            config, repo_root, diag, include_prs=include_prs
+        )
     except ValueError as exc:
         diag.error("issue source construction failed: %s", exc)
         print(f"ralph-afk: {exc}", file=sys.stderr)
@@ -750,6 +866,7 @@ async def run(config: RunConfig) -> int:
         client=client,
         source=source,
         diag=diag,
+        include_prs=include_prs,
     )
 
     exit_code = 1

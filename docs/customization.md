@@ -70,7 +70,7 @@ The **template files** ([`templates/AGENTS.template.md`](../templates/AGENTS.tem
 This skill is the first thing to run in Copilot CLI for any new project, **before** any of the other planning or implementation skills. It does two things:
 
 1. **Populates the `## Agent skills` block at the bottom of `AGENTS.md`** with concrete pointers to the per-repo config below.
-2. **Writes `docs/agents/{issue-tracker,triage-labels,domain}.md`** — the per-repo config files that every other skill (`/to-issues`, `/triage`, `/to-prd`, `/diagnose`, `/tdd`, `/improve-codebase-architecture`, `/zoom-out`) reads to learn which issue tracker, label vocabulary, and context layout this project uses.
+2. **Writes `docs/agents/{issue-tracker,triage-labels,domain}.md`** — the per-repo config files that every other skill (`/to-issues`, `/triage`, `/to-prd`, `/diagnosing-bugs`, `/tdd`, `/improve-codebase-architecture`, `/zoom-out`) reads to learn which issue tracker, label vocabulary, and context layout this project uses.
 
 The skill walks you through three decisions one at a time:
 
@@ -82,7 +82,7 @@ The skill walks you through three decisions one at a time:
 
 ### Skip it and downstream skills will guess
 
-If `/to-issues`, `/triage`, `/to-prd`, `/diagnose`, `/tdd`, or `/improve-codebase-architecture` ever feel like they're missing context about your issue tracker, label vocabulary, or domain layout — that's the signal you skipped this step. Run `/setup-agent-skills` now.
+If `/to-issues`, `/triage`, `/to-prd`, `/diagnosing-bugs`, `/tdd`, or `/improve-codebase-architecture` ever feel like they're missing context about your issue tracker, label vocabulary, or domain layout — that's the signal you skipped this step. Run `/setup-agent-skills` now.
 
 ### Re-running it
 
