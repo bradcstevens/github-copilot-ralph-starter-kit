@@ -64,6 +64,24 @@ async def test_q_requests_stop_and_app_exits() -> None:
     assert app.is_running is False
 
 
+async def test_d_requests_detach_and_app_exits() -> None:
+    """#28: ``d`` tears the TUI down as a **Detach** (not a Stop).
+
+    The app only *signals* the intent (``detach_requested``) and exits; the
+    interactive driver — the app's peer — observes the flag and swaps the live
+    sink back to the line printer so the run keeps printing to scrollback.
+    """
+    app = RalphApp(_make_state())
+    async with app.run_test() as pilot:
+        assert app.detach_requested is False
+        await pilot.press("d")
+        await pilot.pause()
+    # The binding fired and the app left its run loop — as a Detach, not a Stop.
+    assert app.detach_requested is True
+    assert app.stop_requested is False
+    assert app.is_running is False
+
+
 # ---------------------------------------------------------------------------
 # Tabbed navigation (issue #26)
 # ---------------------------------------------------------------------------

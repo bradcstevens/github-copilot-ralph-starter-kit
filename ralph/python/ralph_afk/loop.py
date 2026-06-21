@@ -779,10 +779,15 @@ class InteractiveDriver(Protocol):
       :func:`run` as the primary sink on the interactive path.
     * :meth:`attach_panes` receives the loop-owned Summary/Log pane sources
       (issue #26) before :meth:`run` builds the app.
+    * :meth:`attach_detach` receives the exit-model handoff (issue #28): the
+      swappable :class:`~ralph_afk.sinks.SinkFanout`, the parked line-printer
+      Renderer to swap in on a **Detach**, and the stdout console for the
+      **Stop** scrollback record.
     * :meth:`run` is handed the loop's ``drive`` coroutine-function and is
       responsible for launching it and the Textual app as **peer asyncio
       tasks** (not parent/child), returning the loop's process exit code. A
-      user **Stop** (``q`` / ``Ctrl+C``) cancels the loop task.
+      user **Stop** (``q`` / ``Ctrl+C``) cancels the loop task; a **Detach**
+      (``d``) swaps the sink to the line printer and lets the loop run on.
     """
 
     state: EventSink
@@ -792,6 +797,14 @@ class InteractiveDriver(Protocol):
         *,
         summary: RunSummary | None,
         log_source: Callable[[], str] | None,
+    ) -> None: ...
+
+    def attach_detach(
+        self,
+        *,
+        sinks: SinkFanout,
+        line_printer: EventSink,
+        console: Console,
     ) -> None: ...
 
     async def run(self, drive: Callable[[], Coroutine[object, object, int]]) -> int: ...
@@ -891,6 +904,10 @@ async def run(config: RunConfig, *, driver: InteractiveDriver | None = None) -> 
         )
         sinks = SinkFanout([driver.state, log_renderer])
         driver.attach_panes(summary=summary, log_source=log_buffer.getvalue)
+        # Hand the driver the exit-model seam (issue #28): the swappable sink
+        # list, the parked stdout Renderer to swap in on Detach, and the real
+        # console for the Stop / natural-completion scrollback summary.
+        driver.attach_detach(sinks=sinks, line_printer=renderer, console=console)
     diag = writers.diagnostics
 
     # 4) IssueSource (factory dispatches on config.issue_source). A

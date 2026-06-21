@@ -200,6 +200,7 @@ class RalphApp(App[None]):
         # Ctrl+C is also a Stop. Marked priority so it is honoured regardless
         # of focus; hidden from the footer since it duplicates `q`.
         Binding("ctrl+c", "stop", "Stop", priority=True, show=False),
+        Binding("d", "detach", "Detach"),
         Binding("escape", "focus_tabs", "Tabs"),
     ]
 
@@ -219,6 +220,11 @@ class RalphApp(App[None]):
         #: Set when the user requests a Stop (``q`` / ``Ctrl+C``). Lets a Pilot
         #: test assert the binding fired, and documents the exit cause.
         self.stop_requested = False
+        #: Set when the user requests a **Detach** (``d``): the TUI tears down
+        #: but the run keeps going. The driver (the app's peer) reads this flag
+        #: to swap the live sink back to the line printer instead of cancelling
+        #: the loop (issue #28).
+        self.detach_requested = False
         #: Row keys currently displayed in the queue, so a steady-state refresh
         #: only ticks timer cells (preserving the cursor) and rebuilds the table
         #: solely when the set/order of issues changes.
@@ -262,6 +268,18 @@ class RalphApp(App[None]):
     def action_stop(self) -> None:
         """Stop: tear the app down. The driver then cancels the loop task."""
         self.stop_requested = True
+        self.exit()
+
+    def action_detach(self) -> None:
+        """Detach: tear the app down but leave the run going (issue #28).
+
+        Only signals intent; the interactive driver observes
+        :attr:`detach_requested` once the app exits and swaps the live sink back
+        to the line-printer :class:`~ralph_afk.ui.renderer.Renderer`, so the
+        remainder of the run prints to normal scrollback instead of being
+        cancelled.
+        """
+        self.detach_requested = True
         self.exit()
 
     # -- repaint -----------------------------------------------------------

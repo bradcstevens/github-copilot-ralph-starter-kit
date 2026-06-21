@@ -23,6 +23,7 @@ from ralph_afk import git as git_module
 from ralph_afk import loop as loop_module
 from ralph_afk.config import RunConfig
 from ralph_afk.interactive.state import LiveRunState
+from ralph_afk.sinks import SinkFanout
 
 
 class _FakeClient:
@@ -44,6 +45,9 @@ class _DelegatingDriver:
         self.received_drive: Callable[[], Awaitable[int]] | None = None
         self.attached_summary: Any = None
         self.attached_log_source: Callable[[], str] | None = None
+        self.attached_sinks: Any = None
+        self.attached_line_printer: Any = None
+        self.attached_console: Any = None
 
     def attach_panes(
         self,
@@ -53,6 +57,17 @@ class _DelegatingDriver:
     ) -> None:
         self.attached_summary = summary
         self.attached_log_source = log_source
+
+    def attach_detach(
+        self,
+        *,
+        sinks: Any,
+        line_printer: Any,
+        console: Any,
+    ) -> None:
+        self.attached_sinks = sinks
+        self.attached_line_printer = line_printer
+        self.attached_console = console
 
     async def run(self, drive: Callable[[], Awaitable[int]]) -> int:
         self.run_called = True
@@ -82,6 +97,15 @@ class _SkippingDriver:
     ) -> None:
         self.attached_summary = summary
         self.attached_log_source = log_source
+
+    def attach_detach(
+        self,
+        *,
+        sinks: Any,
+        line_printer: Any,
+        console: Any,
+    ) -> None:
+        pass
 
     async def run(self, drive: Callable[[], Awaitable[int]]) -> int:
         self.run_called = True
@@ -163,6 +187,33 @@ def test_interactive_path_attaches_summary_and_captured_log(
     # the second capture sink).
     assert state.status == "empty_pool"
     assert state.ended is True
+
+
+def test_interactive_path_attaches_detach_handoff(tmp_path, monkeypatch) -> None:
+    """#28: the loop hands the driver the exit-model seam — the swappable
+    :class:`SinkFanout`, the **parked** line-printer Renderer to swap in on a
+    Detach, and the stdout console for the Stop scrollback record."""
+    _wire_empty_pool_repo(tmp_path, monkeypatch)
+    state = LiveRunState(model="claude-opus-4.8", reasoning_effort="max")
+    driver = _DelegatingDriver(state)
+
+    cfg = RunConfig(
+        issue_source="github", max_iterations=1, max_nmt_strikes=3, verbosity=0
+    )
+    exit_code = asyncio.run(loop_module.run(cfg, driver=driver))
+
+    assert exit_code == 0
+    # The driver received the live sink list it can swap on Detach…
+    assert isinstance(driver.attached_sinks, SinkFanout)
+    # …and that *same* fan-out drove the run (the state sink is in it).
+    assert state in driver.attached_sinks.sinks
+    # The line printer handed over is the **parked** stdout Renderer: it is NOT
+    # in the active sink list (otherwise the run would double-print), reserved
+    # for the Detach swap.
+    assert driver.attached_line_printer is not None
+    assert driver.attached_line_printer not in driver.attached_sinks.sinks
+    # The console for the Stop / natural-completion scrollback summary is real.
+    assert driver.attached_console is not None
 
 
 def test_driver_owns_driving_and_run_returns_its_result(tmp_path, monkeypatch) -> None:
