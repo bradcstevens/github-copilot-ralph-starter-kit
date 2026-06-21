@@ -93,7 +93,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Coroutine, Iterable, Protocol
 
 from copilot import CopilotClient
 
@@ -107,7 +107,7 @@ from ralph_afk.persist import (
 )
 from ralph_afk.pricing import Pricing, PricingError, load_pricing
 from ralph_afk.session import IterationSession
-from ralph_afk.sinks import SinkFanout
+from ralph_afk.sinks import EventSink, SinkFanout
 from ralph_afk.sources import (
     AfkReadyItem,
     GitHubIssueSource,
@@ -761,7 +761,32 @@ class _Loop:
         return exit_code
 
 
-async def run(config: RunConfig) -> int:
+class InteractiveDriver(Protocol):
+    """Strategy that runs the loop as an *observed peer* of a Textual app.
+
+    The concrete implementation is
+    :class:`ralph_afk.interactive.driver.InteractiveDriver`. It is referenced
+    here only as a **structural Protocol** so :mod:`ralph_afk.loop` never
+    imports the interactive package — and therefore never imports Textual,
+    keeping the import-guard convention (ADR-0001) intact on the loop side.
+
+    The contract is deliberately tiny:
+
+    * :attr:`state` is the Textual-agnostic
+      :class:`~ralph_afk.interactive.state.LiveRunState`, registered by
+      :func:`run` as the sole sink on the interactive path.
+    * :meth:`run` is handed the loop's ``drive`` coroutine-function and is
+      responsible for launching it and the Textual app as **peer asyncio
+      tasks** (not parent/child), returning the loop's process exit code. A
+      user **Stop** (``q`` / ``Ctrl+C``) cancels the loop task.
+    """
+
+    state: EventSink
+
+    async def run(self, drive: Callable[[], Coroutine[object, object, int]]) -> int: ...
+
+
+async def run(config: RunConfig, *, driver: InteractiveDriver | None = None) -> int:
     """Drive one ``ralph-afk`` invocation to completion.
 
     Constructs the long-lived per-run state (writers, summary, renderer,
@@ -771,6 +796,17 @@ async def run(config: RunConfig) -> int:
     Args:
         config: The frozen :class:`RunConfig` composed by
             :func:`ralph_afk.cli.main`.
+        driver: Optional interactive driver (ADR-0001 observer model). When
+            ``None`` (the default, non-interactive path) the line-printer
+            :class:`~ralph_afk.ui.renderer.Renderer` is the sole sink and the
+            loop is driven directly — **byte-for-byte unchanged**. When
+            supplied, the driver's Textual-agnostic ``state``
+            (:class:`~ralph_afk.interactive.state.LiveRunState`) becomes the
+            sole sink and :meth:`InteractiveDriver.run` launches the loop and a
+            Textual app as **peer asyncio tasks**; ``q`` / ``Ctrl+C`` (Stop)
+            cancels the loop task. The Renderer is still constructed but parked
+            so issue #28's Detach can swap it back in via
+            :meth:`~ralph_afk.sinks.SinkFanout.set_sinks`.
 
     Returns:
         Process exit code:
@@ -824,10 +860,14 @@ async def run(config: RunConfig) -> int:
     )
     # The line-printer Renderer is the sole sink on the non-interactive
     # path (issue #22); JSONL logging is written separately and stays
-    # always-on regardless of which sinks are registered. The interactive
-    # slices (issue #23+) register additional sinks on this same fan-out,
-    # and Detach (#28) swaps the list back to the Renderer via set_sinks.
-    sinks = SinkFanout([renderer])
+    # always-on regardless of which sinks are registered. On the interactive
+    # path (issue #23, ADR-0001) the driver's Textual-agnostic LiveRunState
+    # is the sole sink instead, and the Renderer is parked so Detach (#28) can
+    # swap it back in via set_sinks.
+    if driver is None:
+        sinks = SinkFanout([renderer])
+    else:
+        sinks = SinkFanout([driver.state])
     diag = writers.diagnostics
 
     # 4) IssueSource (factory dispatches on config.issue_source). A
@@ -898,7 +938,13 @@ async def run(config: RunConfig) -> int:
                 # module docstring for the propagation contract.
                 with telemetry.span("ralph_afk.run"):
                     try:
-                        exit_code = await loop.drive()
+                        if driver is None:
+                            exit_code = await loop.drive()
+                        else:
+                            # ADR-0001: the app and the loop run as peer
+                            # asyncio tasks; the driver owns the peering and
+                            # Stop-cancels the loop task.
+                            exit_code = await driver.run(loop.drive)
                     except Exception as exc:
                         diag.error(
                             "ralph_afk loop crashed: %s: %s",

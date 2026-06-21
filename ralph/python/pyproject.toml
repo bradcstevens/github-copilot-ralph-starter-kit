@@ -46,6 +46,20 @@ otel = [
     "opentelemetry-exporter-otlp>=1.20,<2",
 ]
 
+# Optional interactive TUI (issue #23, ADR-0001). Off by default so the base
+# install stays a pure line-printer with no curses/async-screen dependency.
+# Operators who want the live dashboard install `.[tui]`.
+#
+# Textual is pinned BELOW 6 on purpose: Textual 6.x bumps its own floor to
+# `rich>=14`, which would collide with this kit's `rich>=13.7,<14` pin (the
+# line-printer Renderer is built against the Rich 13 API). Every Textual 5.x /
+# late-0.8x release still depends on `rich>=13.3`, so the `<6` ceiling keeps
+# the interactive extra installable alongside the base Rich pin. Treat any bump
+# to `>=6` as a deliberate migration that also moves the `rich` pin.
+tui = [
+    "textual>=0.86,<6",
+]
+
 # Development tooling. Exposed as an extra (not a PEP 735 dependency-group) so
 # it can be installed with `uv pip install -e ".[dev]"` / `pip install -e ".[dev]"`.
 dev = [

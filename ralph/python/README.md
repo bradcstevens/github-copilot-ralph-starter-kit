@@ -30,6 +30,9 @@ uv sync --project ralph/python
 
 # Optional: install the OpenTelemetry extra to enable opt-in tracing.
 uv sync --project ralph/python --extra otel
+
+# Optional: install the interactive TUI extra (live dashboard + Stop).
+uv sync --project ralph/python --extra tui
 ```
 
 **Requires:** Python **≥ 3.11** on PATH, and either
@@ -98,10 +101,11 @@ surface including verbosity flags (`-v`, `-vv`, `-vvv`) and
 | `RALPH_OTEL_ENABLED`              | unset (disabled)               | Truthy (`1`, `true`, `yes`, `on`) enables OpenTelemetry tracing. Requires the `[otel]` extra. When disabled, `opentelemetry` is never imported — base install pays zero cost.                                    |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`     | unset                          | Presence (non-empty) also enables OTel tracing — matches the conventional OTel-ecosystem activation pattern.                                                                                                     |
 | `RALPH_SEND_TIMEOUT_SECONDS`      | `7200` (2 h)                   | Per-iteration `send_and_wait` timeout. The SDK's default of `60` is far too short for AFK iterations that frequently run 30+ minutes.                                                                            |
+| `RALPH_INTERACTIVE`               | unset (auto-detect from TTY)   | Truthy (`1`, `true`, `yes`, `on`) forces the interactive Textual dashboard; falsy (`0`, ...) forces today's line printer. Unset = auto-detect (interactive only on a TTY). Either way the interactive path additionally requires the `[tui]` extra; if it is missing, an explicit request warns and falls back to the line printer. `q` / `Ctrl+C` Stops the run. |
 
 CLI flags (`-v` / `-vv` / `-vvv`, `--no-reasoning`, `--deny-tool`,
-`--deny-skill`) are the runner's only non-positional flags. See
-`ralph-afk --help` for the full list.
+`--deny-skill`, `--interactive` / `--no-interactive`) are the runner's only
+non-positional flags. See `ralph-afk --help` for the full list.
 
 ---
 

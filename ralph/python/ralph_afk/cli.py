@@ -169,6 +169,10 @@ def build_parser() -> argparse.ArgumentParser:
             "  RALPH_PRICING_FILE          Explicit pricing.toml path.\n"
             "  RALPH_OTEL_ENABLED          Truthy '1' enables OTel.\n"
             "  OTEL_EXPORTER_OTLP_ENDPOINT  Presence enables OTel.\n"
+            "  RALPH_INTERACTIVE           '1' forces the TUI, '0' forces "
+            "the line printer\n"
+            "                              (default: auto-detect from TTY; "
+            "needs the [tui] extra).\n"
             "  RALPH_SEND_TIMEOUT_SECONDS  send_and_wait timeout "
             "(default: 7200).\n"
         ),
@@ -226,6 +230,26 @@ def build_parser() -> argparse.ArgumentParser:
             "Reject the named skill (the `skill` meta-tool's "
             "arguments.skill value) at the permission gate. Repeatable. "
             "Unioned with RALPH_DENY_SKILLS env var."
+        ),
+    )
+    parser.add_argument(
+        "--interactive",
+        dest="interactive",
+        action="store_true",
+        default=None,
+        help=(
+            "Force the interactive Textual dashboard (requires the [tui] "
+            "extra). Default: auto-detect from a TTY. Overrides "
+            "RALPH_INTERACTIVE."
+        ),
+    )
+    parser.add_argument(
+        "--no-interactive",
+        dest="interactive",
+        action="store_false",
+        help=(
+            "Force today's line-printer output even on a TTY. Overrides "
+            "RALPH_INTERACTIVE."
         ),
     )
     return parser
@@ -479,6 +503,29 @@ def _build_config(args: argparse.Namespace) -> RunConfig:
     )
 
 
+def _should_run_interactive(args: argparse.Namespace) -> bool:
+    """Resolve whether this invocation takes the interactive (TUI) path.
+
+    Gathers the live inputs — the ``--interactive`` / ``--no-interactive``
+    flag, the ``RALPH_INTERACTIVE`` env override, stdout TTY-ness, and whether
+    the optional ``[tui]`` extra (Textual) is importable — and delegates the
+    precedence to :func:`ralph_afk.interactive.detect.resolve_interactive`.
+    Imported lazily so a non-interactive invocation never pays the import.
+    """
+    from ralph_afk.interactive.detect import (
+        resolve_interactive,
+        textual_available,
+    )
+
+    return resolve_interactive(
+        flag=args.interactive,
+        env_value=os.environ.get("RALPH_INTERACTIVE"),
+        isatty=sys.stdout.isatty(),
+        textual_importable=textual_available(),
+        warn=_warn,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point registered as the ``ralph-afk`` console script.
 
@@ -507,6 +554,17 @@ def main(argv: list[str] | None = None) -> int:
     # Import here so the SDK / Rich / pricing only load if we're
     # actually going to run. Keeps `ralph-afk --help` snappy.
     from ralph_afk import loop as _loop
+
+    # Interactive path (issue #23, ADR-0001): launch the loop as a peer of a
+    # Textual app observing a LiveRunState. The driver module imports Textual,
+    # so it is reached only once `_should_run_interactive` has confirmed the
+    # [tui] extra is importable. Every non-interactive condition keeps today's
+    # exact line-printer behavior (driver left as None).
+    if _should_run_interactive(args):
+        from ralph_afk.interactive.driver import build_interactive_driver
+
+        driver = build_interactive_driver(config)
+        return asyncio.run(_loop.run(config, driver=driver))
 
     return asyncio.run(_loop.run(config))
 
