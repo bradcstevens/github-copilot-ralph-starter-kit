@@ -1,74 +1,89 @@
-# `<PROJECT_NAME>`
+# GitHub Copilot Ralph Starter Kit
 
-> **Template notice.** This file is a starting point. `CONTEXT.md` is the canonical domain glossary for a project — the place where ambiguous words get one agreed-upon meaning. It is normally created lazily by the `/grill-with-docs` skill the first time a term needs resolving; this stub exists so new projects start with the right shape. Replace every `` `<PLACEHOLDER>` `` with real content, address every `> 📝` note, then delete this notice. Once filled in, this file is referenced by `AGENTS.md`, by every PRD, and by every slice issue — keep it tight and current.
->
-> Full format reference: `~/.copilot/skills/grill-with-docs/CONTEXT-FORMAT.md` (or the project-local copy at `.copilot/skills/grill-with-docs/CONTEXT-FORMAT.md` if `ralph/` was copied in).
-
-## How to use this template
-
-1. Replace every backticked placeholder like `` `<PROJECT_NAME>` `` with real content. Grep for `<[A-Z_]` to find them.
-2. Read every `> 📝` blockquote note and act on it, then delete the note.
-3. Delete any section whose first line is `> 🗑️ DELETE IF NOT APPLICABLE` that you don't need.
-4. If your repo is multi-context (multiple bounded contexts in one repo), delete this file and create a `CONTEXT-MAP.md` at the repo root instead — see the **Multi-context repos** section below for the shape.
-5. Run `/grill-with-docs` to extend this file organically as new terms come up; do not pre-populate every term you can think of.
-6. Delete this whole **How to use this template** section.
-
----
-
-> 📝 Replace this paragraph with one or two sentences describing what this context is and why it exists. For a single-context repo this is just the project's domain summary. For a sub-context inside a multi-context repo (`src/<bounded-context>/CONTEXT.md`), describe the boundary this context owns.
-
-`<ONE_OR_TWO_SENTENCE_CONTEXT_DESCRIPTION>`.
+The kit's domain is the **AFK runner**: an unattended loop that drives the GitHub
+Copilot CLI to implement triaged GitHub Issues one at a time. This glossary fixes
+the vocabulary that the runner, its prompts, and its live interface all share.
 
 ## Language
 
-> 📝 The canonical terms in this project's vocabulary, each defined in one tight sentence. Be opinionated — when multiple words exist for the same concept, pick the winner and list the losers under `_Avoid_`. Only include terms specific to this context; general programming concepts (timeout, retry, error) don't belong even if the project uses them heavily. Group under subheadings (e.g. `### Domain entities`, `### Lifecycle states`) only when natural clusters emerge — a flat list is fine for small projects.
+### The run loop
 
-**`<TERM_1>`**:
-`<ONE_SENTENCE_DEFINITION — what it IS, not what it does>`.
-_Avoid_: `<ALIAS_1>`, `<ALIAS_2>`
+**Run**:
+One invocation of the AFK loop, identified by a `run_id`, spanning many iterations
+until the work is exhausted or the strike limit is reached.
 
-**`<TERM_2>`**:
-`<ONE_SENTENCE_DEFINITION>`.
-_Avoid_: `<ALIAS_1>`
+**Iteration**:
+One cycle of the loop — collect the pool, let the agent work exactly one task, then
+do commit accounting and a progress check. The unit by which elapsed time and
+streamed output are measured and attributed.
+_Avoid_: round, pass, tick.
 
-**`<TERM_3>`**:
-`<ONE_SENTENCE_DEFINITION>`.
+**Pool**:
+The set of AFK-ready issues collected at the start of an iteration and offered to
+the agent together in a single prompt; the agent picks one.
+_Avoid_: batch, backlog.
+
+**Strike**:
+A recorded instance of an iteration making no meaningful progress; a fixed number of
+strikes ends the run.
+_Avoid_: failure, miss.
+
+### Issues and attribution
+
+**Active issue**:
+The single issue the agent is working during the current iteration, self-selected
+from the pool.
+_Avoid_: current task, current ticket.
+
+**Working marker**:
+The agent's explicit, up-front declaration of its active issue, used to attribute the
+iteration's timing and streamed output to that issue in real time.
+
+**Queue**:
+The per-run ledger of every issue seen in any pool during the run, each carrying a
+status; the selectable list shown in the live interface. Distinct from the pool,
+which is a single iteration's input.
+_Avoid_: backlog, list.
+
+**Status**:
+An issue's lifecycle within a run: **queued** (seen, not yet worked), **active**
+(being worked now), **closed** (finished and closed via a commit close-keyword),
+**advanced** (progressed but not closed), **no-progress** (worked without meaningful
+change), **gone** (left the pool without resolution).
+
+### Leaving a run
+
+**Stop**:
+Ending a run deliberately — the current iteration is wound down cleanly and the loop
+exits.
+_Avoid_: quit, kill, abort.
+
+**Detach**:
+Leaving the live interface while the run keeps going unattended, falling back to the
+line-by-line scrollback output.
+_Avoid_: background, minimize, exit.
 
 ## Relationships
 
-> 📝 How the terms above connect — express cardinality where it matters. Two or three bullets is usually enough; this section is a sanity check on the **Language** section, not an ERD.
-
-- A **`<TERM_1>`** has many **`<TERM_2>`s**
-- A **`<TERM_2>`** belongs to exactly one **`<TERM_3>`**
+- A **Run** has many **Iterations**.
+- An **Iteration** is offered one **Pool** and produces at most one **Active issue**.
+- A **Queue** belongs to exactly one **Run** and aggregates every issue seen across
+  its **Iterations**, keyed by issue.
+- An **Active issue** is the **Pool** member named by the current **Working marker**.
 
 ## Example dialogue
 
-> 🗑️ DELETE IF NOT APPLICABLE — keep this section once you have real terms; a short dev ↔ domain-expert exchange is the fastest way to show how the terms interact and to expose hidden ambiguity.
-
-> **Dev:** "When a `<TERM_1>` is `<VERB>`d, does it produce a `<TERM_2>` immediately?"
-> **Domain expert:** "No — a `<TERM_2>` is only produced once `<PRECONDITION>` holds."
+> **Dev:** "If the agent works issue #12 across two different iterations, is that one
+> queue entry or two?"
+> **Domain expert:** "One **Queue** entry — the queue is keyed by issue, and its
+> active time sums across every iteration that worked it. Those are two distinct
+> **Iterations**, but the same **Active issue**."
 
 ## Flagged ambiguities
 
-> 📝 Words that were previously overloaded or used inconsistently, with the resolution that this file enforces. New ambiguities get appended here as `/grill-with-docs` resolves them. Empty is fine on day one.
-
-- `<AMBIGUOUS_WORD>` was used to mean both `<MEANING_A>` and `<MEANING_B>` — resolved: `<MEANING_A>` is **`<CANONICAL_TERM>`**; `<MEANING_B>` is no longer used.
-
----
-
-## Multi-context repos
-
-> 🗑️ DELETE IF NOT APPLICABLE — keep only if your repo has more than one bounded context. In that case **delete this `CONTEXT.md`** and create a `CONTEXT-MAP.md` at the repo root with a per-context `CONTEXT.md` under each context folder. Shape:
->
-> ```md
-> # Context Map
->
-> ## Contexts
->
-> - [<Context A>](./src/<context-a>/CONTEXT.md) — `<one-line summary>`
-> - [<Context B>](./src/<context-b>/CONTEXT.md) — `<one-line summary>`
->
-> ## Relationships
->
-> - **<Context A> → <Context B>**: `<event or shared-type relationship>`
-> ```
+- `queue` was used to mean both a single iteration's input set and the whole-run list
+  of issues — resolved: the per-iteration input is the **Pool**; the whole-run,
+  status-bearing list is the **Queue**.
+- `current task` / `current issue` was used loosely for whatever the agent was doing —
+  resolved: the agent's in-flight selection is the **Active issue**, declared via its
+  **Working marker**.
