@@ -72,6 +72,29 @@ def _install_fake_loop_run(
     monkeypatch.setattr(loop_module, "run", fake_run)
 
 
+def _install_fake_resolve_run_model(
+    monkeypatch: pytest.MonkeyPatch,
+    result: tuple[str | None, str | None] | None = None,
+) -> None:
+    """Stub the startup picker so ``main`` never makes a live ``list_models()``.
+
+    Returns ``result`` (a chosen ``(model, effort)``) when given, else echoes the
+    config's env/default — mirroring the picker's own fallback — so the driver
+    dispatch is exercised without a TTY or SDK client.
+    """
+
+    async def fake_resolve(
+        config: RunConfig, *, warn: Any
+    ) -> tuple[str | None, str | None]:
+        if result is not None:
+            return result
+        return config.model, config.reasoning_effort
+
+    from ralph_afk.interactive import picker as picker_module
+
+    monkeypatch.setattr(picker_module, "resolve_run_model", fake_resolve)
+
+
 def test_main_non_interactive_passes_no_driver(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -93,6 +116,7 @@ def test_main_interactive_builds_and_passes_driver(
 ) -> None:
     monkeypatch.setattr(cli_module, "resolve_repo_root", lambda: tmp_path)
     monkeypatch.setattr(cli_module, "_should_run_interactive", lambda args: True)
+    _install_fake_resolve_run_model(monkeypatch)
 
     sentinel = object()
     import ralph_afk.interactive.driver as driver_module
@@ -110,3 +134,48 @@ def test_main_interactive_builds_and_passes_driver(
     assert len(captured) == 1
     _cfg, driver = captured[0]
     assert driver is sentinel
+
+
+def test_main_interactive_bakes_picker_selection_into_run_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #24: the run uses *exactly* the model + effort the picker returned.
+
+    The picker's selection is baked into the frozen :class:`RunConfig` the loop
+    consumes, overriding the env/default the CLI first composed.
+    """
+    monkeypatch.setattr(cli_module, "resolve_repo_root", lambda: tmp_path)
+    monkeypatch.setattr(cli_module, "_should_run_interactive", lambda args: True)
+    # The operator picked a different model + effort than the kit default.
+    _install_fake_resolve_run_model(monkeypatch, result=("gpt-5.4", "high"))
+
+    captured: list[tuple[RunConfig, Any]] = []
+    _install_fake_loop_run(monkeypatch, captured)
+
+    rc = cli_module.main([])
+
+    assert rc == 0
+    cfg, driver = captured[0]
+    assert cfg.model == "gpt-5.4"
+    assert cfg.reasoning_effort == "high"
+    # The driver was built from the *baked* config (its observed state seeds
+    # from the chosen model/effort).
+    assert driver is not None
+
+
+def test_main_interactive_no_effort_selection_is_baked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A reasoning-incapable pick bakes ``reasoning_effort=None`` into the config."""
+    monkeypatch.setattr(cli_module, "resolve_repo_root", lambda: tmp_path)
+    monkeypatch.setattr(cli_module, "_should_run_interactive", lambda args: True)
+    _install_fake_resolve_run_model(monkeypatch, result=("claude-opus-4.5", None))
+
+    captured: list[tuple[RunConfig, Any]] = []
+    _install_fake_loop_run(monkeypatch, captured)
+
+    cli_module.main([])
+
+    cfg, _driver = captured[0]
+    assert cfg.model == "claude-opus-4.5"
+    assert cfg.reasoning_effort is None

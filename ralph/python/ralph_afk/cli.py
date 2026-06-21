@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import os
 import subprocess
 import sys
@@ -561,12 +562,38 @@ def main(argv: list[str] | None = None) -> int:
     # [tui] extra is importable. Every non-interactive condition keeps today's
     # exact line-printer behavior (driver left as None).
     if _should_run_interactive(args):
-        from ralph_afk.interactive.driver import build_interactive_driver
-
-        driver = build_interactive_driver(config)
-        return asyncio.run(_loop.run(config, driver=driver))
+        return asyncio.run(_drive_interactive(config))
 
     return asyncio.run(_loop.run(config))
+
+
+async def _drive_interactive(config: RunConfig) -> int:
+    """Run the one-time startup picker, then drive the observed loop (#23/#24).
+
+    The interactive entrypoint runs inside one :func:`asyncio.run` so the
+    picker's **throwaway** ``list_models()`` client (an async SDK call) and the
+    peer-task loop share a single event loop:
+
+    1. :func:`ralph_afk.interactive.picker.resolve_run_model` resolves the run's
+       model + reasoning effort via the live two-stage picker (issue #24),
+       falling back to the env/default already in ``config`` on any failure.
+    2. The choice is baked into a fresh frozen :class:`RunConfig` (the loop still
+       creates and owns its *own* run client).
+    3. The interactive driver launches the loop as a peer of the observing app
+       (ADR-0001).
+    """
+    from ralph_afk import loop as _loop
+    from ralph_afk.interactive import picker
+
+    model, reasoning_effort = await picker.resolve_run_model(config, warn=_warn)
+    config = dataclasses.replace(
+        config, model=model, reasoning_effort=reasoning_effort
+    )
+
+    from ralph_afk.interactive.driver import build_interactive_driver
+
+    driver = build_interactive_driver(config)
+    return await _loop.run(config, driver=driver)
 
 
 if __name__ == "__main__":  # pragma: no cover - import-as-script convenience
