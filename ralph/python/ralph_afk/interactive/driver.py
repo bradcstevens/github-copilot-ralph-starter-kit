@@ -36,7 +36,10 @@ __all__ = ["InteractiveDriver", "build_interactive_driver"]
 
 #: Factory for the observing app, injected so tests can swap in a fake app and
 #: exercise the peering/Stop logic without a TTY. Accepts the state plus the
-#: optional loop-owned panes (``summary`` / ``log_source``) attached for #26.
+#: optional loop-owned panes (``summary`` / ``log_source``): ``summary`` feeds
+#: the Dashboard's compact Summary rollup band; ``log_source`` is retained for
+#: the factory contract but no longer rendered (the whole-run Log tab is retired,
+#: ADR-0003).
 AppFactory = Callable[..., "RalphApp"]
 
 
@@ -75,9 +78,12 @@ class InteractiveDriver:
 
         Called by :func:`ralph_afk.loop.run` after it constructs the shared
         :class:`~ralph_afk.ui.summary.RunSummary` and the buffer-backed capture
-        renderer, so the app's Summary and Log tabs render the same data the
-        line printer would. The loop owns these objects (it also reads
-        ``summary`` for persistence); the driver only forwards them to the app.
+        renderer. ``summary`` feeds the Dashboard's compact **Summary** rollup
+        band (ADR-0003); ``log_source`` is forwarded for the app-factory contract
+        but no longer rendered — the whole-run Log tab is retired and the
+        per-issue **Log** reads the state's transcript instead. The loop owns
+        these objects (it also reads ``summary`` for persistence); the driver
+        only forwards them to the app.
         """
         self.summary = summary
         self.log_source = log_source

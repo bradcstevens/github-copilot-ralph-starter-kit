@@ -1,9 +1,18 @@
-"""Pilot smoke test for ``ralph_afk.interactive.app`` (issue #23).
+"""Pilot tests for ``ralph_afk.interactive.app`` — the tabless two-level live
+interface (ADR-0003, issue #30).
 
 Gated behind ``pytest.importorskip("textual")`` so the base (no ``[tui]`` extra)
-install skips it. Asserts the live header renders the run's identity/state and
-that **Stop** (``q``) tears the app down — the end-to-end proof that the Textual
-observer is wired to the :class:`~ralph_afk.interactive.state.LiveRunState`.
+install skips it. These cover the structural backbone:
+
+* **Level 1 — the Dashboard** (the only top-level screen, no tab bar): the
+  header band, the live **Queue**, and a compact **Summary** rollup band,
+  stacked.
+* **Level 2 — the per-issue Log**: ``enter`` on a Queue row opens that issue's
+  **Log**; ``escape`` returns to the Dashboard with the Queue cursor preserved.
+
+plus the unchanged exit model — **Stop** (``q`` / ``Ctrl+C``) and **Detach**
+(``d``). The pure Queue / Log projections are unit-tested without a TTY in
+``test_interactive_queue.py`` / ``test_interactive_transcript.py``.
 """
 
 from __future__ import annotations
@@ -16,15 +25,15 @@ from rich.text import Text  # noqa: E402
 from textual.widgets import ContentSwitcher, DataTable, Static  # noqa: E402
 
 from ralph_afk import events as events_module  # noqa: E402
-from ralph_afk.interactive.app import RalphApp, TabBar  # noqa: E402
+from ralph_afk.interactive.app import RalphApp, _Dashboard, _LogView  # noqa: E402
 from ralph_afk.interactive.state import LiveRunState  # noqa: E402
 
 
 class _FakeSummary:
-    """Duck-typed stand-in: the app only calls ``build_run_table()``."""
+    """Duck-typed stand-in: the app only calls ``build_rollup_band()``."""
 
-    def build_run_table(self) -> str:
-        return "SUMMARY-TABLE-MARKER"
+    def build_rollup_band(self) -> str:
+        return "ROLLUP-BAND-MARKER"
 
 
 def _make_state() -> LiveRunState:
@@ -41,6 +50,11 @@ def _make_state() -> LiveRunState:
         {"type": events_module.WRAPPER_STRIKE, "strikes": 1, "max_strikes": 3}
     )
     return state
+
+
+# ---------------------------------------------------------------------------
+# Header + exit model
+# ---------------------------------------------------------------------------
 
 
 async def test_header_renders_run_identity_and_state() -> None:
@@ -84,7 +98,7 @@ async def test_d_requests_detach_and_app_exits() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Tabbed navigation (issue #26)
+# Level 1: the tabless Dashboard
 # ---------------------------------------------------------------------------
 
 
@@ -103,31 +117,22 @@ def _state_with_queue() -> LiveRunState:
     return state
 
 
-async def test_tabs_switch_with_arrow_enter_and_esc() -> None:
+async def test_no_tab_bar_dashboard_is_the_only_top_level() -> None:
+    """No tab bar / ContentSwitcher; the Dashboard stacks header + Queue + band."""
     app = RalphApp(_make_state(), refresh_interval=3600)
-    async with app.run_test() as pilot:
-        switcher = app.query_one(ContentSwitcher)
-        tabs = app.query_one(TabBar)
-        # The tab bar holds focus and the Dashboard is the initial tab.
-        assert isinstance(app.focused, TabBar)
-        assert switcher.current == "dashboard-pane"
-
-        # Arrow moves the selection but does NOT switch until Enter.
-        await pilot.press("right")
-        assert tabs.selected == 1
-        assert switcher.current == "dashboard-pane"
-        await pilot.press("enter")
-        assert switcher.current == "log-pane"
-
-        # Esc returns to the tab bar; arrow + Enter reaches the Summary tab.
-        await pilot.press("escape")
-        assert isinstance(app.focused, TabBar)
-        await pilot.press("right", "enter")
-        assert switcher.current == "summary-pane"
-
-        # ...and back to the Dashboard.
-        await pilot.press("escape", "left", "left", "enter")
-        assert switcher.current == "dashboard-pane"
+    async with app.run_test():
+        # The retired tabbed structure is gone.
+        assert len(app.query(ContentSwitcher)) == 0
+        # The Dashboard is the only top-level screen and stacks the three bands.
+        dashboard = app.query_one("#dashboard", _Dashboard)
+        assert dashboard.display is True
+        assert app.query_one("#header", Static) is not None
+        assert app.query_one("#queue", DataTable) is not None
+        assert app.query_one("#summary-band", Static) is not None
+        # The per-issue Log (Level 2) exists but is hidden until a row is opened.
+        assert app.query_one("#log", _LogView).display is False
+        # The Queue holds focus from the start (no tab bar to traverse first).
+        assert isinstance(app.focused, DataTable)
 
 
 async def test_dashboard_queue_lists_issues_active_first_and_cursor_moves() -> None:
@@ -140,47 +145,26 @@ async def test_dashboard_queue_lists_issues_active_first_and_cursor_moves() -> N
         assert table.get_row_at(0)[1] == "active"
         assert table.get_row_at(1)[1] == "queued"
 
-        # Enter on the (already-selected) Dashboard tab focuses the queue.
-        await pilot.press("enter")
+        # The Queue already has focus; arrow keys move its cursor.
         assert isinstance(app.focused, DataTable)
         assert table.cursor_row == 0
         await pilot.press("down")
         assert table.cursor_row == 1
 
 
-async def test_log_pane_shows_captured_output() -> None:
-    app = RalphApp(
-        _make_state(), log_source=lambda: "LOG-LINE-XYZZY", refresh_interval=3600
-    )
-    async with app.run_test() as pilot:
-        await pilot.press("right", "enter")  # activate the Log tab
-        body = app.query_one("#log-body", Static)
-        assert "LOG-LINE-XYZZY" in str(body.renderable)
-
-
-async def test_summary_pane_renders_summary_table() -> None:
+async def test_summary_band_renders_rollup() -> None:
     app = RalphApp(
         _make_state(),
         summary=_FakeSummary(),  # type: ignore[arg-type]
         refresh_interval=3600,
     )
-    async with app.run_test() as pilot:
-        await pilot.press("right", "right", "enter")  # activate the Summary tab
-        body = app.query_one("#summary-body", Static)
-        assert "SUMMARY-TABLE-MARKER" in str(body.renderable)
-
-
-async def test_esc_returns_focus_to_tab_bar_from_queue() -> None:
-    app = RalphApp(_state_with_queue(), refresh_interval=3600)
-    async with app.run_test() as pilot:
-        await pilot.press("enter")  # focus the queue
-        assert isinstance(app.focused, DataTable)
-        await pilot.press("escape")
-        assert isinstance(app.focused, TabBar)
+    async with app.run_test():
+        band = app.query_one("#summary-band", Static)
+        assert "ROLLUP-BAND-MARKER" in str(band.renderable)
 
 
 # ---------------------------------------------------------------------------
-# Queue drill-in + live streaming detail (issue #27)
+# Level 2: Enter opens the per-issue Log, Esc returns to the Dashboard
 # ---------------------------------------------------------------------------
 
 
@@ -208,26 +192,25 @@ def _dimmed_text(text: Text) -> str:
     )
 
 
-async def test_drill_in_active_issue_shows_live_transcript_and_esc_returns() -> None:
+async def test_enter_opens_active_issue_log_and_esc_returns() -> None:
     app = RalphApp(_state_with_active_transcript(), refresh_interval=3600)
     async with app.run_test() as pilot:
-        await pilot.press("enter")  # Dashboard tab -> focus the queue
+        # The Queue holds focus; Enter on the active row (#26) opens its Log.
         assert isinstance(app.focused, DataTable)
-        await pilot.press("enter")  # Enter on the active row (#26) -> drill in
+        await pilot.press("enter")
         await pilot.pause()
 
-        # The detail view replaces the queue in the same region (no new tab).
-        queue = app.query_one("#queue", DataTable)
-        detail = app.query_one("#detail")
-        assert detail.display is True
-        assert queue.display is False
-        assert app.query_one(ContentSwitcher).current == "dashboard-pane"
+        # Level 2: the Log replaces the Dashboard (no tab bar, no switcher).
+        dashboard = app.query_one("#dashboard", _Dashboard)
+        log = app.query_one("#log", _LogView)
+        assert log.display is True
+        assert dashboard.display is False
 
-        header = str(app.query_one("#detail-header", Static).renderable)
+        header = str(app.query_one("#log-header", Static).renderable)
         assert "#26" in header
         assert "status active" in header
 
-        body = app.query_one("#detail-body", Static).renderable
+        body = app.query_one("#log-body", Static).renderable
         assert isinstance(body, Text)
         # Interleaved transcript: reasoning + message + the tool-call event.
         assert "weighing the options" in body.plain
@@ -238,30 +221,48 @@ async def test_drill_in_active_issue_shows_live_transcript_and_esc_returns() -> 
         assert "weighing the options" in dimmed
         assert "Here is my plan" not in dimmed
 
-        # Esc returns to the queue; the tab bar stayed on the Dashboard.
+        # Esc returns to the Dashboard (Level 1); the Queue regains focus.
         await pilot.press("escape")
         await pilot.pause()
-        assert detail.display is False
-        assert queue.display is True
+        assert log.display is False
+        assert dashboard.display is True
         assert isinstance(app.focused, DataTable)
-        assert app.query_one(ContentSwitcher).current == "dashboard-pane"
 
 
-async def test_drill_in_non_active_issue_shows_details_only() -> None:
+async def test_enter_opens_non_active_issue_log_shows_details_only() -> None:
     app = RalphApp(_state_with_active_transcript(), refresh_interval=3600)
     async with app.run_test() as pilot:
-        await pilot.press("enter")  # focus the queue
+        table = app.query_one("#queue", DataTable)
         await pilot.press("down")  # move to the queued row (#27)
-        await pilot.press("enter")  # drill into the non-active issue
+        assert table.cursor_row == 1
+        await pilot.press("enter")  # open the non-active issue's Log
         await pilot.pause()
 
-        header = str(app.query_one("#detail-header", Static).renderable)
+        header = str(app.query_one("#log-header", Static).renderable)
         assert "#27" in header
         assert "status queued" in header
 
-        body = app.query_one("#detail-body", Static).renderable
+        body = app.query_one("#log-body", Static).renderable
         assert isinstance(body, Text)
-        # Details only: no live transcript leaks into a non-active issue's view.
+        # Details only: no live transcript leaks into a non-active issue's Log.
         assert "weighing the options" not in body.plain
         assert "» bash" not in body.plain
         assert "details only" in body.plain
+
+        # Esc returns to the Dashboard with the Queue cursor preserved on #27.
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.query_one("#log", _LogView).display is False
+        assert isinstance(app.focused, DataTable)
+        assert table.cursor_row == 1
+
+
+async def test_esc_on_dashboard_is_a_noop() -> None:
+    """With no tab bar, Esc on the Dashboard does nothing (and never crashes)."""
+    app = RalphApp(_state_with_queue(), refresh_interval=3600)
+    async with app.run_test() as pilot:
+        assert app.query_one("#dashboard", _Dashboard).display is True
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.query_one("#dashboard", _Dashboard).display is True
+        assert app.query_one("#log", _LogView).display is False

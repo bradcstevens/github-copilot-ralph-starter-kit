@@ -1101,6 +1101,64 @@ def test_run_summary_totals_sum_tokens_and_costs() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Compact Summary rollup band (ADR-0003 — the Dashboard's Summary band)
+# ---------------------------------------------------------------------------
+
+
+def test_rollup_band_shows_run_level_totals() -> None:
+    """The compact Summary rollup band mirrors the run-end table's run totals.
+
+    ADR-0003's Dashboard stacks this single-line band under the Queue; it
+    surfaces the same summed tokens / cost / commits / closures / strikes the
+    run-end Table footer does, kept live (not frozen) across iterations.
+    """
+    renderer, summary, _buf = _make_renderer(pricing_date="2026-05-16")
+    for i, issue in enumerate([42, 43], start=1):
+        renderer.render({"type": WRAPPER_ITERATION_START, "iter": i, "issue": issue})
+        renderer.render(
+            {
+                "type": USAGE_TOKENS,
+                "model": "claude-opus-4.7-xhigh",
+                "input": 1000,
+                "output": 200,
+            }
+        )
+        renderer.render(
+            {"type": WRAPPER_COMMIT_RECORDED, "sha": "deadbeef", "subject": "x"}
+        )
+        renderer.render({"type": WRAPPER_AUTO_CLOSE, "issue": issue, "sha": "deadbeef"})
+        renderer.render({"type": WRAPPER_ITERATION_END, "iter": i})
+    text = summary.build_rollup_band().plain
+    assert "Summary" in text
+    assert "iters 2" in text
+    assert "in=2,000 out=400" in text
+    assert "commits 2" in text
+    assert "closures 2" in text
+    assert "strikes 0" in text
+    # A priced model surfaces a real cost, not the unknown em dash.
+    assert "$" in text
+
+
+def test_rollup_band_unknown_model_cost_is_em_dash() -> None:
+    """An unknown-model run renders the cost as the existing em dash, not a crash."""
+    renderer, summary, _buf = _make_renderer()
+    renderer.render({"type": WRAPPER_ITERATION_START, "iter": 1, "issue": 7})
+    renderer.render(
+        {"type": USAGE_TOKENS, "model": "unknown-model", "input": 10, "output": 5}
+    )
+    renderer.render({"type": WRAPPER_ITERATION_END, "iter": 1})
+    assert "cost —" in summary.build_rollup_band().plain
+
+
+def test_rollup_band_with_no_iterations_renders_zeroes() -> None:
+    """Before any iteration completes the band still renders (all zeroes)."""
+    _renderer, summary, _buf = _make_renderer()
+    text = summary.build_rollup_band().plain
+    assert "iters 0" in text
+    assert "commits 0" in text
+
+
+# ---------------------------------------------------------------------------
 # No-ANSI guarantee
 # ---------------------------------------------------------------------------
 

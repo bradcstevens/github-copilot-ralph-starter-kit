@@ -451,6 +451,29 @@ class RunSummary:
             )
         return table
 
+    def build_rollup_band(self) -> Text:
+        """Compose the compact **Summary** rollup band for the Dashboard (ADR-0003).
+
+        A single-line, *live* (not frozen) run-level totals strip — the band of
+        the Dashboard stacked under the Queue. It mirrors the run-end
+        :meth:`build_run_table` footer: summed tokens, estimated cost, commits,
+        closures, and the final strike count, plus the iteration count for
+        context. Returned as a Rich :class:`~rich.text.Text` the interactive app
+        drops into a ``Static``; the full per-iteration table stays the run-end
+        artefact. Cost renders as the em dash when no completed iteration had a
+        priced model (the same unknown-model treatment as the table footer).
+        """
+        totals = self.totals()
+        text = Text()
+        text.append("Summary", style=STYLES["meta"])
+        text.append(f"  •  iters {totals.iterations}")
+        text.append(f"  •  tokens in={totals.tokens_in:,} out={totals.tokens_out:,}")
+        text.append(f"  •  cost {_format_decimal_footer(totals.cost_usd)}")
+        text.append(f"  •  commits {totals.commits}")
+        text.append(f"  •  closures {totals.auto_closures}")
+        text.append(f"  •  strikes {totals.final_strikes}")
+        return text
+
     # -- internal -----------------------------------------------------------
 
     def _format_context_line(self, snap: IterationSnapshot) -> Text:
