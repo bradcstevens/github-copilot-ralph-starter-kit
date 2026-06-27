@@ -27,10 +27,11 @@ Design notes:
 * **Detection-only PRDs completion.** Early drafts proposed an active
   wrapper-side ``os.replace`` to move completed PRDs to ``done/``.
   The rubber-duck pass at design time flagged a hard bug: the move
-  dirties the working tree, which then trips the *next* iteration's
-  stale-worktree guard (``git.is_dirty``). The agent owns the
-  move-and-commit; the wrapper just discovers the resulting state on
-  the next iteration.
+  dirties the working tree. Under ADR-0004 that dirty tree is now
+  absorbed by the runner Checkpoint rather than aborting, but the
+  decision stands for a cleaner reason — the agent owns the
+  move-and-commit so the closure is a real, attributable agent commit;
+  the wrapper just discovers the resulting state on the next iteration.
 * **stdlib + ``gh``/``git``/``wrapper`` modules only.** No SDK, no
   Rich, no peer-of-loop imports — the Protocol seam stays light.
 * **Format helpers live with the impl that uses them.**
@@ -636,11 +637,12 @@ class PrdsIssueSource:
     Completion semantics: **detection-only**. The agent is responsible
     for ``git mv prds/<feat>/NNN-*.md prds/<feat>/done/`` per
     ``ralph/PROMPT.md``'s local-markdown mode contract.
-    :meth:`handle_completions` always returns ``[]``. Active wrapper-side
-    moves would dirty the working tree, which would trip the next
-    iteration's stale-worktree guard (:func:`git.is_dirty`). The agent's
+    :meth:`handle_completions` always returns ``[]``. The agent's
     ``git mv`` commit IS the closure signal; next iteration's discovery
-    automatically excludes ``done/``.
+    automatically excludes ``done/``. (A wrapper-side move would dirty
+    the tree, which ADR-0004's Checkpoint would now capture rather than
+    abort on — but the agent owning the commit keeps the closure
+    attributable.)
     """
 
     def __init__(self, repo_root: Path, diag: logging.Logger) -> None:

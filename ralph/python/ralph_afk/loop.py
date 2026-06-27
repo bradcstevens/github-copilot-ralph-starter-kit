@@ -25,29 +25,35 @@ inside :func:`run` once per iteration.
 Per-iteration sequence:
 
 1. Cap check on ``max_iterations``.
-2. **Stale-worktree guard** via :func:`ralph_afk.git.is_dirty`.
-3. Collect AFK-ready pool via :meth:`IssueSource.collect_afk_ready`.
-4. Clean-exit on empty pool.
-5. Build prompt: ``"Previous commits: <last5> Issues: <blocks> " + prompt_md``
+2. Collect AFK-ready pool via :meth:`IssueSource.collect_afk_ready`.
+3. Clean-exit on empty pool.
+4. Build prompt: ``"Previous commits: <last5> Issues: <blocks> " + prompt_md``
    where each ``<block>`` is the source-rendered
    :attr:`AfkReadyItem.rendered_block`.
-6. Capture ``pre_sha`` *immediately* before invoking the SDK — so a slow
+5. Capture ``pre_sha`` *immediately* before invoking the SDK — so a slow
    ``gh issue_view`` call before this point cannot affect the
    ``commits_between(pre_sha, head)`` accounting after.
-7. Open :class:`~ralph_afk.session.IterationSession`,
+6. Open :class:`~ralph_afk.session.IterationSession`,
    ``await session.send_and_wait(prompt, timeout=long)``.
-8. ``head_sha = git.head_sha()``; ``commits = git.commits_between(pre, head)``.
-9. Emit one ``wrapper.commit.recorded`` per new commit so the renderer
+7. ``head_sha = git.head_sha()``; ``commits = git.commits_between(pre, head)``.
+8. Emit one ``wrapper.commit.recorded`` per new commit so the renderer
    increments the iteration's commit count.
-10. **Completion backstop** via
-    :meth:`IssueSource.handle_completions`. Each returned
-    :class:`~ralph_afk.sources.Completion` produces one
-    ``wrapper.auto_close`` event. The GitHub backend closes issues via
-    ``gh issue close``; the PRDs backend returns an empty list (the
-    agent owns ``git mv ... prds/<feat>/done/``).
+9. **Completion backstop** via
+   :meth:`IssueSource.handle_completions`. Each returned
+   :class:`~ralph_afk.sources.Completion` produces one
+   ``wrapper.auto_close`` event. The GitHub backend closes issues via
+   ``gh issue close``; the PRDs backend returns an empty list (the
+   agent owns ``git mv ... prds/<feat>/done/``).
+10. **Runner Checkpoint** (ADR-0004) via :meth:`_maybe_checkpoint`: a dirty
+    or untracked worktree is staged and captured in a single
+    close-keyword-free ``wrapper.checkpoint.recorded`` commit attributed to
+    the Active issue. Deliberately ordered *after* the agent-commit
+    accounting (step 8) and *before* strike accounting (step 11), so the
+    Checkpoint is excluded from both the Summary commit tally and the Strike
+    machine. Non-fatal: a failure warns and the loop carries on.
 11. NMT strike accounting: progress (``commits>0`` or ``auto_closures>0``)
     resets strikes; no-progress increments, possibly tripping the
-    abort threshold.
+    abort threshold. Checkpoints are *not* progress.
 12. Emit ``wrapper.iteration.end`` (renderer closes snapshot panel) and
     persist :class:`~ralph_afk.persist.IterationCounters` from the
     closed snapshot.
@@ -118,7 +124,12 @@ from ralph_afk.sources import (
 )
 from ralph_afk.telemetry import otel as telemetry
 from ralph_afk.ui import Renderer, RunSummary, get_console
-from ralph_afk.wrapper import NMTStrikeStateMachine
+from ralph_afk.wrapper import (
+    NMTStrikeStateMachine,
+    checkpoint_message,
+    extract_close_refs,
+    filter_to_pool,
+)
 
 __all__ = ["run"]
 
@@ -378,16 +389,15 @@ class _Loop:
 
             * ``"continue"`` — iteration completed, loop should keep going.
             * ``"empty_pool"`` — AFK-ready pool was empty; clean exit 0.
-            * ``"stale_worktree"`` — dirty worktree; abort exit 1.
             * ``"aborted"`` — NMT strike machine tripped; abort exit 1.
 
         OTel span tree: opens ``ralph_afk.iteration`` for the entire body,
         with three children — ``ralph_afk.collect_issues`` around the
         pool discovery, ``ralph_afk.session`` around the SDK session
         lifecycle, and ``ralph_afk.enforce_closures`` around the
-        source-specific completion backstop. Empty-pool and
-        stale-worktree paths emit only the partial subtree (no
-        ``session`` / ``enforce_closures`` spans); see
+        source-specific completion backstop. The empty-pool path emits
+        only the partial subtree (no ``session`` / ``enforce_closures``
+        spans); see
         ``tests/test_iteration_end_to_end.py::test_loop_emits_otel_span_tree_when_enabled``.
         """
         with telemetry.span(
@@ -398,19 +408,7 @@ class _Loop:
                 iter_num=iter_num,
             )
 
-            # 1) Stale-worktree guard.
-            if git_module.is_dirty(self._repo_root):
-                self._emit(
-                    events_module.WRAPPER_STALE_WORKTREE_ABORTED,
-                    iter_num=iter_num,
-                )
-                # Close the snapshot the renderer just opened so the run-end
-                # Table doesn't show a half-open row.
-                self._emit(events_module.WRAPPER_ITERATION_END, iter_num=iter_num)
-                self._record_counters(iter_num)
-                return ("stale_worktree", 0, 0)
-
-            # 1b) PR branch hygiene. A prior PR iteration may have run
+            # 1) PR branch hygiene. A prior PR iteration may have run
             #     `gh pr checkout <N>` and left HEAD on the PR branch. The
             #     worktree is clean (the guard above just passed), so restore
             #     the captured base branch — otherwise this iteration's
@@ -587,7 +585,19 @@ class _Loop:
                     )
             auto_closures = len(completions)
 
-            # 8) Strike state machine + emit appropriate events.
+            # 8) Runner Checkpoint (ADR-0004). Capture any dirty / untracked
+            #    work-in-progress in a single close-keyword-free Checkpoint
+            #    commit so the next iteration starts from a clean tree and no
+            #    work is ever lost. Deliberately AFTER the agent-commit
+            #    accounting above (step 6) and BEFORE the Strike machine below,
+            #    so the Checkpoint is structurally excluded from both: it never
+            #    counts as a commit in the Summary (it emits
+            #    ``wrapper.checkpoint.recorded``, not ``wrapper.commit.recorded``)
+            #    and it never resets a Strike. Non-fatal — a failure warns and
+            #    the loop carries on (a local-only repo still completes).
+            self._maybe_checkpoint(iter_num, pool, completions, new_commits)
+
+            # 9) Strike state machine + emit appropriate events.
             outcome = self._strike_machine.tick(
                 commits_in_iter=len(new_commits),
                 auto_closures_in_iter=auto_closures,
@@ -606,13 +616,107 @@ class _Loop:
                     outcome=("abort" if outcome == "aborted" else "warn"),
                 )
 
-            # 9) Close the iteration snapshot, persist counters.
+            # 10) Close the iteration snapshot, persist counters.
             self._emit(events_module.WRAPPER_ITERATION_END, iter_num=iter_num)
             self._record_counters(iter_num)
 
             if outcome == "aborted":
                 return ("aborted", len(new_commits), auto_closures)
             return ("continue", len(new_commits), auto_closures)
+
+    def _maybe_checkpoint(
+        self,
+        iter_num: int,
+        pool: list[AfkReadyItem],
+        completions: list[Any],
+        new_commits: list[git_module.Commit],
+    ) -> str | None:
+        """Capture a dirty / untracked worktree in one Checkpoint commit.
+
+        The runner-authored safety net of ADR-0004. If the worktree has any
+        uncommitted tracked change (:func:`git.is_dirty`) or any untracked,
+        non-ignored file (:func:`git.has_untracked`), stage everything
+        (``git add -A``, honouring ``.gitignore``) and make a single
+        **close-keyword-free** Checkpoint commit attributed to the Active issue
+        (so the auto-close backstop never fires on it), then emit
+        ``wrapper.checkpoint.recorded``.
+
+        Every git interaction is wrapped: a missing remote, an empty index, or
+        any other :exc:`git.GitError` warns and returns ``None`` rather than
+        aborting the run, so a clean tree, a non-repo, and a local-only repo all
+        complete normally.
+
+        Returns:
+            The new Checkpoint commit SHA, or ``None`` when nothing was
+            captured (clean tree) or the Checkpoint could not be made.
+        """
+        try:
+            dirty = git_module.is_dirty(self._repo_root)
+            untracked = git_module.has_untracked(self._repo_root)
+        except git_module.GitError as exc:
+            self._diag.warning(
+                "checkpoint dirty-check failed: %s; skipping checkpoint", exc
+            )
+            return None
+        if not (dirty or untracked):
+            return None
+
+        active_ref = self._infer_active_ref(pool, completions, new_commits)
+        try:
+            git_module.add_all(self._repo_root)
+            sha = git_module.commit(
+                checkpoint_message(active_ref), self._repo_root
+            )
+        except git_module.GitError as exc:
+            self._diag.warning(
+                "checkpoint commit failed: %s; continuing without it", exc
+            )
+            return None
+
+        self._emit(
+            events_module.WRAPPER_CHECKPOINT_RECORDED,
+            iter_num=iter_num,
+            sha=sha,
+            issue=active_ref,
+        )
+        self._diag.info(
+            "recorded checkpoint %s (attributed to %s)", sha, active_ref
+        )
+        return sha
+
+    def _infer_active_ref(
+        self,
+        pool: list[AfkReadyItem],
+        completions: list[Any],
+        new_commits: list[git_module.Commit],
+    ) -> int | str | None:
+        """Best-effort guess of the iteration's Active issue for a Checkpoint.
+
+        The non-interactive loop has no ``<working issue=N>`` marker tap (that
+        lives in the interactive state), so it infers attribution from what it
+        does know, in priority order:
+
+        1. The first completion's ref (an issue we just auto-closed / a PR we
+           advanced) — the strongest signal of what was worked.
+        2. The first AFK-ready pool member referenced by a closing keyword in
+           this iteration's agent commits — the agent named it even if the
+           closure didn't fire.
+        3. A single-member pool — the only candidate.
+
+        Falls back to ``None`` (an *unattributed* Checkpoint) when the pool has
+        several issues and nothing above disambiguates them.
+        """
+        if completions:
+            return completions[0].ref
+        pool_ints = {item.ref for item in pool if isinstance(item.ref, int)}
+        if pool_ints:
+            joined = "\n".join(c.message for c in new_commits)
+            refs = filter_to_pool(extract_close_refs(joined), pool_ints)
+            if refs:
+                return refs[0]
+        if len(pool) == 1:
+            return pool[0].ref
+        return None
 
     def _handle_completions_safely(
         self,
@@ -725,10 +829,6 @@ class _Loop:
                         outcome_label = "empty_pool"
                         exit_code = 0
                         break
-                    if outcome == "stale_worktree":
-                        outcome_label = "stale_worktree"
-                        exit_code = 1
-                        break
                     if outcome == "aborted":
                         outcome_label = "stuck"
                         exit_code = 1
@@ -837,7 +937,7 @@ async def run(config: RunConfig, *, driver: InteractiveDriver | None = None) -> 
 
         * ``0`` — clean termination (empty AFK-ready pool or
           ``max_iterations`` cap reached).
-        * ``1`` — abort (stale worktree, NMT strike threshold,
+        * ``1`` — abort (NMT strike threshold or
           preflight / setup failure).
     """
     # 1) Repo root + prompt file.

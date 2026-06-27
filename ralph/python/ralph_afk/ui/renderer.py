@@ -55,13 +55,13 @@ from ralph_afk.events import (
     WRAPPER_AFK_READY_COLLECTED,
     WRAPPER_ASK_USER_ATTEMPTED,
     WRAPPER_AUTO_CLOSE,
+    WRAPPER_CHECKPOINT_RECORDED,
     WRAPPER_COMMIT_RECORDED,
     WRAPPER_ITERATION_END,
     WRAPPER_ITERATION_START,
     WRAPPER_PR_ADVANCED,
     WRAPPER_RUN_END,
     WRAPPER_RUN_START,
-    WRAPPER_STALE_WORKTREE_ABORTED,
     WRAPPER_STRIKE,
 )
 
@@ -254,13 +254,22 @@ class Renderer:
             )
         self.console.print(text)
 
-    def _on_stale_worktree_aborted(self, event: dict[str, Any]) -> None:
+    def _on_checkpoint_recorded(self, event: dict[str, Any]) -> None:
+        # A runner-authored Checkpoint (ADR-0004). Rendered DISTINCTLY from an
+        # agent commit (different glyph, "checkpoint" label) and deliberately
+        # NOT counted toward the Summary's commit tally — Checkpoints are
+        # excluded from agent commit accounting.
+        sha = event.get("sha", "")
+        issue = event.get("issue")
+        short = sha[:10] if isinstance(sha, str) else ""
         text = Text()
-        text.append("✗ ", style=STYLES["error"])
-        text.append(
-            "stale worktree — aborting (commit or stash before re-running)",
-            style=STYLES["error"],
-        )
+        text.append("⎘ ", style=STYLES["meta"])
+        text.append("checkpoint ", style=STYLES["meta"])
+        if short:
+            text.append(short, style=STYLES["meta"])
+        if issue is not None:
+            label = f"#{issue}" if isinstance(issue, int) else str(issue)
+            text.append(f"  ({label})", style=STYLES["meta"])
         self.console.print(text)
 
     def _on_commit_recorded(self, event: dict[str, Any]) -> None:
@@ -525,7 +534,7 @@ _HANDLERS: dict[str, Callable[[Renderer, dict[str, Any]], None]] = {
     WRAPPER_ITERATION_START: Renderer._on_iteration_start,
     WRAPPER_ITERATION_END: Renderer._on_iteration_end,
     WRAPPER_AFK_READY_COLLECTED: Renderer._on_afk_ready_collected,
-    WRAPPER_STALE_WORKTREE_ABORTED: Renderer._on_stale_worktree_aborted,
+    WRAPPER_CHECKPOINT_RECORDED: Renderer._on_checkpoint_recorded,
     WRAPPER_COMMIT_RECORDED: Renderer._on_commit_recorded,
     WRAPPER_AUTO_CLOSE: Renderer._on_auto_close,
     WRAPPER_PR_ADVANCED: Renderer._on_pr_advanced,

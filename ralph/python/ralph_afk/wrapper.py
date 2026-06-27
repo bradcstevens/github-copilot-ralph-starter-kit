@@ -41,6 +41,9 @@ __all__ = [
     "filter_to_pool",
     "did_iteration_make_progress",
     "NMTStrikeStateMachine",
+    "CHECKPOINT_TRAILER_KEY",
+    "checkpoint_message",
+    "is_checkpoint_message",
 ]
 
 # Byte-for-byte the PRD-specified close-keyword pattern. The convention is
@@ -121,6 +124,70 @@ def did_iteration_make_progress(
         ``True`` if either count is non-zero.
     """
     return commits_in_iter > 0 or auto_closures_in_iter > 0
+
+
+# --------------------------------------------------------------------------- #
+# Runner Checkpoint message contract (issue #32 — ADR-0004)                   #
+# --------------------------------------------------------------------------- #
+
+#: Commit-trailer key that tags a runner-authored **Checkpoint**. The runner
+#: writes ``Ralph-Checkpoint: <ref>`` so a Checkpoint is distinguishable from an
+#: agent commit in ``git log`` and so :func:`is_checkpoint_message` can detect
+#: one without re-deriving the convention. The value is the active issue ref
+#: (or ``unattributed``) — deliberately NOT ``#N``, so a Checkpoint never opens
+#: a GitHub cross-reference on the issue every iteration.
+CHECKPOINT_TRAILER_KEY = "Ralph-Checkpoint"
+
+#: Attribution value when the active issue could not be inferred.
+_CHECKPOINT_UNATTRIBUTED = "unattributed"
+
+_CHECKPOINT_BODY = (
+    "Runner-authored Checkpoint (ADR-0004): staged the worktree the agent left\n"
+    "uncommitted so the next iteration starts on a clean tree and the work can\n"
+    "reach the remote. Not an agent commit; excluded from Strike progress."
+)
+
+
+def checkpoint_message(active_ref: int | str | None) -> str:
+    """Build the commit message for a runner **Checkpoint** (ADR-0004).
+
+    The message is guaranteed **close-keyword-free** — it never matches
+    :data:`CLOSE_KEYWORD_RE`, so neither the wrapper's auto-close backstop nor
+    GitHub's native close-on-push can fire on a Checkpoint — and it carries the
+    :data:`CHECKPOINT_TRAILER_KEY` trailer attributing it to the active issue.
+
+    Args:
+        active_ref: The active issue the Checkpoint is attributed to — an int
+            issue number, a str ref (PRDs path / PR), or ``None`` when the
+            runner could not infer it.
+
+    Returns:
+        A ``subject\\n\\nbody\\n\\ntrailer`` commit message.
+    """
+    if active_ref is None:
+        subject = "Checkpoint: capture uncommitted work-in-progress"
+        attribution = _CHECKPOINT_UNATTRIBUTED
+    elif isinstance(active_ref, int):
+        subject = f"Checkpoint: capture work-in-progress for issue {active_ref}"
+        attribution = str(active_ref)
+    else:
+        subject = f"Checkpoint: capture work-in-progress for {active_ref}"
+        attribution = str(active_ref)
+    trailer = f"{CHECKPOINT_TRAILER_KEY}: {attribution}"
+    return f"{subject}\n\n{_CHECKPOINT_BODY}\n\n{trailer}"
+
+
+def is_checkpoint_message(message: str) -> bool:
+    """Return ``True`` if ``message`` carries the Checkpoint trailer.
+
+    Tolerant of surrounding whitespace and case so a Checkpoint authored by
+    :func:`checkpoint_message` round-trips, while an ordinary agent commit
+    (even one that merely mentions a checkpoint in prose) does not.
+    """
+    prefix = f"{CHECKPOINT_TRAILER_KEY.lower()}:"
+    return any(
+        line.strip().lower().startswith(prefix) for line in message.split("\n")
+    )
 
 
 # Outcome alphabet — kept narrow on purpose. The loop only needs to know

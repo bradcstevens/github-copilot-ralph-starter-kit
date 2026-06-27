@@ -386,3 +386,43 @@ def test_full_iteration_lifecycle_marker_then_close() -> None:
     assert closed.ended_at == 43.0
     assert state.ledger[26].status == STATUS_QUEUED
     assert state.active_ref is None
+
+
+# ---------------------------------------------------------------------------
+# Runner Checkpoint (issue #32) — folded but never counted as agent work
+# ---------------------------------------------------------------------------
+
+
+def test_checkpoint_does_not_count_as_a_commit_or_advance() -> None:
+    """A runner Checkpoint must not mark the active issue ``advanced``.
+
+    Only agent commits / closures advance an issue. A Checkpoint-only
+    iteration is still no-progress (a strike), exactly as if the agent had
+    left a dirty tree without committing.
+    """
+    clock = _FakeClock()
+    state = _make_state(clock)
+    _start_iteration(state, iteration=1, issues=[12])
+    clock.advance(5)
+    state.stream_message("<working issue=12>")
+    state.render(
+        _ev(events_module.WRAPPER_CHECKPOINT_RECORDED, sha="cap123", issue=12)
+    )
+    clock.advance(25)
+    state.render(_ev(events_module.WRAPPER_ITERATION_END, iter=1))
+
+    entry = state.ledger[12]
+    assert entry.status == STATUS_NO_PROGRESS
+    assert entry.ended_at is None
+
+
+def test_checkpoint_renders_as_distinct_transcript_line() -> None:
+    state = _make_state()
+    _start_iteration(state, iteration=1, issues=[12])
+    state.stream_message("<working issue=12>")
+    state.render(
+        _ev(events_module.WRAPPER_CHECKPOINT_RECORDED, sha="cap1234567890", issue=12)
+    )
+    texts = [line.text for line in state.transcript()]
+    assert any("checkpoint" in t.lower() for t in texts)
+    assert any("cap1234567" in t for t in texts)

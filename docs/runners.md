@@ -17,7 +17,7 @@ The runner enforces the **wrapper contract** — `ready-for-agent` filter, `## W
 | `INCLUDE_PRS`                    | env var; `1`/`true`/`yes` to also collect `ready-for-agent` PRs (GitHub mode). Overrides `docs/agents/issue-tracker.md`; default auto-detects from that file, off unless opted in |
 | `MAX_NMT_STRIKES`                | env var (default `3`)                                                                                                                          |
 | Exit `0` — clean                 | empty AFK-ready pool **or** iteration cap reached                                                                                              |
-| Exit `1` — aborted               | `MAX_NMT_STRIKES` tripped, pre-iteration stale worktree, post-iteration stash failure, **or** preflight/setup failure (gh not authed, prompt file missing, malformed pricing, etc.) |
+| Exit `1` — aborted               | `MAX_NMT_STRIKES` tripped **or** preflight/setup failure (gh not authed, prompt file missing, malformed pricing, etc.) |
 | Observability artefacts          | `.ralph/logs/<iso>-<run_id>.jsonl` (replay JSONL) + `.ralph/runs/<iso>-<run_id>.json` (per-iteration rollup) + `.ralph/logs/<iso>-<run_id>.log` (stderr mirror) |
 | Terminal UX                      | Rich-rendered iteration `Panel`s, per-iteration token + live-catalog estimated-cost signal, run-end summary table                              |
 | OpenTelemetry tracing            | opt-in via `uv sync --project ralph/python --extra otel` + `RALPH_OTEL_ENABLED=1` (or `OTEL_EXPORTER_OTLP_ENDPOINT`)                            |
@@ -51,11 +51,12 @@ INCLUDE_PRS=1 uv run --project ralph/python ralph-afk
 
 ## Per-iteration flow
 
-1. **Stale-worktree guard.** Refuses to start if the working tree is dirty (uncommitted changes from a previous iteration would otherwise get absorbed into the next one). When PR support is on, it also restores the base branch first — a prior PR iteration may have left HEAD on a PR branch from `gh pr checkout`.
+1. **Branch hygiene (PR mode).** When PR support is on, it restores the base branch first — a prior PR iteration may have left HEAD on a PR branch from `gh pr checkout`. A dirty worktree no longer aborts the run: leftover changes are captured by the **Checkpoint** step below (ADR-0004).
 2. **Collect.** Pulls every open issue labeled `ready-for-agent` via `gh issue list`, then filters to those whose body contains both `## What to build` and `## Acceptance criteria` (a `## Parent` section is optional; bare PRDs are skipped). When PR support is on, it also pulls every open PR labeled `ready-for-agent` (discriminated by an `## Agent Brief` in the PR body or a comment) and renders them as `=== PR #N: <title> [labels: ...] (branch: <head-branch>) ===` blocks.
 3. **Run.** Feeds the filtered set, the last five commits, and [`ralph/PROMPT.md`](../ralph/PROMPT.md) to a fresh `copilot --yolo -p` invocation. Streams the agent's reasoning, tool calls, and tool output to the terminal. Captures Copilot's exit code via `PIPESTATUS` so a crash isn't mistaken for a clean turn.
 4. **Auto-close backstop.** Walks new commits for GitHub closing keywords (`Closes/Fixes/Resolves #N`, case-insensitive) **restricted to issue numbers that were in this iteration's AFK-ready pool**. Any referenced issue that's still open gets closed by the wrapper with a comment pointing at the commit SHA(s). The pool whitelist prevents a stale or mis-numbered `Closes #N` from acting on an unrelated issue — and is restricted to issues, so a PR in the pool is never closed by the backstop.
 5. **Progress accounting.** An iteration "made progress" if it produced commits or wrapper closures. A PR also counts as progress when its head SHA advances (the agent pushed to the PR branch) — detected by re-fetching each pool PR and comparing its live head SHA. The wrapper never merges or closes PRs; advancement is the only signal it records. Otherwise the iteration counts as a strike.
+6. **Checkpoint (durability net).** After accounting, if the working tree has any uncommitted or untracked changes, the runner stages everything (`git add -A`, honouring `.gitignore`) and makes a single **close-keyword-free** Checkpoint commit attributed to the active issue — so no work is ever lost and the next iteration starts from a clean tree. Checkpoints are **excluded from strike progress** (only agent commits and closures reset strikes, so the stuck-agent abort still fires) and from the run-summary commit tally. A Checkpoint failure (e.g. nothing to commit) warns but never aborts.
 
 ## Exit conditions
 
@@ -64,7 +65,7 @@ INCLUDE_PRS=1 uv run --project ralph/python ralph-afk
 | Clean — queue empty   | `0`  | Start of an iteration finds the AFK-ready pool empty.                                  |
 | Clean — iteration cap | `0`  | Optional positional arg `N` reached without natural termination.                       |
 | **Aborted — stuck**   | `1`  | `MAX_NMT_STRIKES` (default 3) consecutive iterations made no progress.                 |
-| **Aborted — preflight** | `1`  | A required precondition failed before the first iteration: missing `ralph/PROMPT.md`, missing [`docs/agents/issue-tracker.md`](customization.md#auto-bootstrap-behavior) (i.e. `/setup-agent-skills` hasn't run), `gh` not authed, dirty worktree, malformed pricing, or stash failure. |
+| **Aborted — preflight** | `1`  | A required precondition failed before the first iteration: missing `ralph/PROMPT.md`, missing [`docs/agents/issue-tracker.md`](customization.md#auto-bootstrap-behavior) (i.e. `/setup-agent-skills` hasn't run), `gh` not authed, or malformed pricing. |
 
 The legacy `<promise>NO MORE TASKS</promise>` sentinel is now **informational only**: the wrapper counts it as a strike if the iteration made no progress, otherwise ignores it. The next iteration's collection is always the source of truth on whether work remains.
 

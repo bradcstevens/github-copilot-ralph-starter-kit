@@ -15,11 +15,14 @@ import pytest
 
 from ralph_afk import wrapper
 from ralph_afk.wrapper import (
+    CHECKPOINT_TRAILER_KEY,
     CLOSE_KEYWORD_RE,
     NMTStrikeStateMachine,
+    checkpoint_message,
     did_iteration_make_progress,
     extract_close_refs,
     filter_to_pool,
+    is_checkpoint_message,
 )
 
 
@@ -354,3 +357,49 @@ def test_wrapper_module_imports_only_stdlib() -> None:
                 f"wrapper.py must not import from {module!r} "
                 f"(allowlist: {sorted(allowed_imports)})"
             )
+
+
+# --------------------------------------------------------------------------- #
+# Checkpoint message contract (issue #32 — runner Checkpoint, ADR-0004)        #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("ref", [32, None, "prds/featA/001-ready.md"])
+def test_checkpoint_message_is_close_keyword_free(ref) -> None:
+    """A Checkpoint must never trip the auto-close backstop / GitHub on push."""
+    assert extract_close_refs(checkpoint_message(ref)) == []
+
+
+def test_checkpoint_message_carries_trailer_with_int_ref() -> None:
+    msg = checkpoint_message(32)
+    assert f"{CHECKPOINT_TRAILER_KEY}: 32" in msg
+    assert is_checkpoint_message(msg) is True
+
+
+def test_checkpoint_message_references_active_issue_in_subject() -> None:
+    subject = checkpoint_message(32).split("\n", 1)[0]
+    assert "32" in subject
+
+
+def test_checkpoint_message_unattributed_when_ref_is_none() -> None:
+    msg = checkpoint_message(None)
+    assert f"{CHECKPOINT_TRAILER_KEY}: unattributed" in msg
+    assert is_checkpoint_message(msg) is True
+
+
+def test_checkpoint_message_carries_trailer_with_str_ref() -> None:
+    msg = checkpoint_message("prds/featA/001-ready.md")
+    assert f"{CHECKPOINT_TRAILER_KEY}: prds/featA/001-ready.md" in msg
+
+
+def test_checkpoint_message_does_not_embed_hash_ref() -> None:
+    """No ``#N`` anywhere, so a Checkpoint never creates a GitHub cross-ref."""
+    assert "#" not in checkpoint_message(32)
+
+
+def test_is_checkpoint_message_false_for_agent_commit() -> None:
+    assert is_checkpoint_message("feat(x): real work\n\nCloses #5") is False
+
+
+def test_is_checkpoint_message_tolerates_surrounding_whitespace() -> None:
+    assert is_checkpoint_message(f"sub\n\n   {CHECKPOINT_TRAILER_KEY}: 7  ") is True

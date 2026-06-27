@@ -67,7 +67,7 @@ __all__ = [
     "WRAPPER_ITERATION_START",
     "WRAPPER_ITERATION_END",
     "WRAPPER_AFK_READY_COLLECTED",
-    "WRAPPER_STALE_WORKTREE_ABORTED",
+    "WRAPPER_CHECKPOINT_RECORDED",
     "WRAPPER_COMMIT_RECORDED",
     "WRAPPER_AUTO_CLOSE",
     "WRAPPER_PR_ADVANCED",
@@ -104,7 +104,7 @@ WRAPPER_RUN_END = "wrapper.run.end"
 WRAPPER_ITERATION_START = "wrapper.iteration.start"
 WRAPPER_ITERATION_END = "wrapper.iteration.end"
 WRAPPER_AFK_READY_COLLECTED = "wrapper.afk_ready.collected"
-WRAPPER_STALE_WORKTREE_ABORTED = "wrapper.stale_worktree.aborted"
+WRAPPER_CHECKPOINT_RECORDED = "wrapper.checkpoint.recorded"
 WRAPPER_COMMIT_RECORDED = "wrapper.commit.recorded"
 WRAPPER_AUTO_CLOSE = "wrapper.auto_close"
 WRAPPER_PR_ADVANCED = "wrapper.pr.advanced"

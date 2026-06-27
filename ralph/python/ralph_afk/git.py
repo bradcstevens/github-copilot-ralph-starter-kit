@@ -13,11 +13,17 @@ Public surface:
   can scan both subject and body for closure keywords in one pass.
 * :func:`repo_root` — top-level directory via ``git rev-parse --show-toplevel``.
 * :func:`head_sha` — current HEAD SHA via ``git rev-parse HEAD``.
-* :func:`is_dirty` — stale-worktree guard: returns ``True`` if either
+* :func:`is_dirty` — tracked-change probe feeding the runner Checkpoint
+  (ADR-0004): returns ``True`` if either
   ``git diff --quiet`` or ``git diff --cached --quiet`` exits with code 1.
   Codes ``> 1`` indicate a
   real git failure (corrupted index, etc.) and raise :exc:`GitError` rather
   than being conflated with "dirty".
+* :func:`has_untracked` — companion probe: ``True`` if any untracked,
+  non-ignored file exists (``git ls-files --others --exclude-standard``).
+* :func:`add_all` / :func:`commit` — the mutating half of the runner
+  Checkpoint (``git add -A`` then ``git commit -m``); the user's git config
+  stays the single source of truth.
 * :func:`commits_between` — list of :class:`Commit` for ``pre..head``.
 * :func:`recent_commits` — last ``n`` commits, newest-first.
 * :func:`range_count` — ``git rev-list --count`` for ``pre..head``.
@@ -47,6 +53,9 @@ __all__ = [
     "repo_root",
     "head_sha",
     "is_dirty",
+    "has_untracked",
+    "add_all",
+    "commit",
     "current_branch",
     "switch",
     "commits_between",
@@ -207,20 +216,21 @@ def head_sha(start: Path | str | None = None) -> str:
 def is_dirty(start: Path | str | None = None) -> bool:
     """Return ``True`` if the working tree has uncommitted staged or unstaged changes.
 
-    The stale-worktree guard::
+    Feeds the runner Checkpoint (ADR-0004)::
 
         if ! git diff --quiet || ! git diff --cached --quiet; then
-            # dirty
+            # dirty -> capture in a Checkpoint commit
         fi
 
     ``git diff --quiet`` exits ``0`` on clean and ``1`` on dirty. Codes
     ``> 1`` indicate a real git failure (corrupted index, missing object,
     etc.) and we raise :exc:`GitError` rather than silently treating the
-    failure as "dirty" — the loop's stale-worktree guard wants to surface
-    a real problem with a real error message.
+    failure as "dirty" — the loop wants to surface a real problem with a
+    real error message.
 
     Note: ``is_dirty`` does NOT check for untracked
-    files; an untracked file alone does not make the tree "dirty".
+    files (:func:`has_untracked` does); an untracked file alone does not make
+    the tree "dirty". The Checkpoint path ORs the two so it captures both.
 
     Args:
         start: Directory inside the repo to run from. Defaults to cwd.
@@ -250,6 +260,78 @@ def is_dirty(start: Path | str | None = None) -> bool:
                 cmd, completed.returncode, _stderr_tail(completed.stderr)
             )
     return False
+
+
+def has_untracked(start: Path | str | None = None) -> bool:
+    """Return ``True`` if the working tree has any untracked, non-ignored file.
+
+    Complements :func:`is_dirty` (which sees only tracked-file changes): the
+    runner Checkpoint (ADR-0004) captures *both* dirty tracked files and brand
+    new untracked files the agent forgot to ``git add``. Uses::
+
+        git ls-files --others --exclude-standard
+
+    ``--others`` lists files git is not tracking; ``--exclude-standard`` honours
+    ``.gitignore`` / ``.git/info/exclude`` / the global excludes file, so an
+    ignored build artefact never trips a Checkpoint. Non-empty output means at
+    least one untracked, non-ignored path exists.
+
+    Args:
+        start: Directory inside the repo to run from. Defaults to cwd.
+
+    Raises:
+        GitError: If ``git`` is not on PATH or ``ls-files`` fails (e.g. ``start``
+            is not inside a git repository).
+    """
+    out = _run(["ls-files", "--others", "--exclude-standard"], cwd=start)
+    return bool(out.strip())
+
+
+def add_all(start: Path | str | None = None) -> None:
+    """Stage every change in the worktree via ``git add -A``.
+
+    Stages modifications, deletions, and new (non-ignored) files in one pass,
+    honouring ``.gitignore`` exactly as the user's git config dictates. This is
+    the staging half of the runner Checkpoint (ADR-0004); the user's git config
+    stays the single source of truth (no ``--force``, no excludes override).
+
+    Args:
+        start: Directory inside the repo to run from. Defaults to cwd.
+
+    Raises:
+        GitError: If ``git`` is not on PATH or the ``add`` fails.
+    """
+    _run(["add", "-A"], cwd=start)
+
+
+def commit(message: str, start: Path | str | None = None) -> str:
+    """Create a commit with ``message`` and return the new ``HEAD`` SHA.
+
+    The commit half of the runner Checkpoint (ADR-0004). A plain
+    ``git commit -m <message>`` so the user's git config — identity, signing
+    key, hooks — stays the single source of truth; the runner never bypasses
+    ``--no-verify`` or overrides the author. ``message`` may carry multiple
+    paragraphs (subject, body, trailer) separated by blank lines; they survive
+    git's default ``-m`` cleanup.
+
+    The caller is expected to have staged something first (e.g. via
+    :func:`add_all`): ``git commit`` with an empty index exits non-zero and
+    raises :exc:`GitError`, which the loop treats as a non-fatal skipped
+    Checkpoint rather than an abort.
+
+    Args:
+        message: The full commit message (subject + optional body/trailer).
+        start: Directory inside the repo to run from. Defaults to cwd.
+
+    Returns:
+        The full 40-character SHA of the newly created commit.
+
+    Raises:
+        GitError: If ``git`` is not on PATH, nothing is staged, or the commit
+            otherwise fails (e.g. a pre-commit hook rejected it).
+    """
+    _run(["commit", "-m", message], cwd=start)
+    return head_sha(start)
 
 
 def current_branch(start: Path | str | None = None) -> str | None:

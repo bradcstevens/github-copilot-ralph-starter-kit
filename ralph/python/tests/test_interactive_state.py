@@ -237,6 +237,10 @@ def test_state_event_type_constants_match_events() -> None:
         == events_module.WRAPPER_AFK_READY_COLLECTED
     )
     assert state_module._COMMIT_RECORDED == events_module.WRAPPER_COMMIT_RECORDED
+    assert (
+        state_module._CHECKPOINT_RECORDED
+        == events_module.WRAPPER_CHECKPOINT_RECORDED
+    )
     assert state_module._AUTO_CLOSE == events_module.WRAPPER_AUTO_CLOSE
     assert state_module._PR_ADVANCED == events_module.WRAPPER_PR_ADVANCED
     assert state_module._ITERATION_END == events_module.WRAPPER_ITERATION_END

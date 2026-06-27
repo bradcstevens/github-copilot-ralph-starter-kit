@@ -70,12 +70,12 @@ from ralph_afk.events import (
     WRAPPER_AFK_READY_COLLECTED,
     WRAPPER_ASK_USER_ATTEMPTED,
     WRAPPER_AUTO_CLOSE,
+    WRAPPER_CHECKPOINT_RECORDED,
     WRAPPER_COMMIT_RECORDED,
     WRAPPER_ITERATION_END,
     WRAPPER_ITERATION_START,
     WRAPPER_RUN_END,
     WRAPPER_RUN_START,
-    WRAPPER_STALE_WORKTREE_ABORTED,
     WRAPPER_STRIKE,
     make_event,
     map_sdk_event,
@@ -95,7 +95,7 @@ def test_wrapper_event_constants_are_literal_strings() -> None:
     assert WRAPPER_ITERATION_START == "wrapper.iteration.start"
     assert WRAPPER_ITERATION_END == "wrapper.iteration.end"
     assert WRAPPER_AFK_READY_COLLECTED == "wrapper.afk_ready.collected"
-    assert WRAPPER_STALE_WORKTREE_ABORTED == "wrapper.stale_worktree.aborted"
+    assert WRAPPER_CHECKPOINT_RECORDED == "wrapper.checkpoint.recorded"
     assert WRAPPER_COMMIT_RECORDED == "wrapper.commit.recorded"
     assert WRAPPER_AUTO_CLOSE == "wrapper.auto_close"
     assert WRAPPER_STRIKE == "wrapper.strike"

@@ -43,12 +43,12 @@ from ralph_afk.events import (
     WRAPPER_AFK_READY_COLLECTED,
     WRAPPER_ASK_USER_ATTEMPTED,
     WRAPPER_AUTO_CLOSE,
+    WRAPPER_CHECKPOINT_RECORDED,
     WRAPPER_COMMIT_RECORDED,
     WRAPPER_ITERATION_END,
     WRAPPER_ITERATION_START,
     WRAPPER_RUN_END,
     WRAPPER_RUN_START,
-    WRAPPER_STALE_WORKTREE_ABORTED,
     WRAPPER_STRIKE,
     make_event,
 )
@@ -547,11 +547,45 @@ def test_wrapper_strike_renders_warning() -> None:
     assert "strike" in out.lower() or "warn" in out.lower()
 
 
-def test_wrapper_stale_worktree_aborted_renders_error() -> None:
+def test_wrapper_checkpoint_recorded_renders_distinctly() -> None:
     renderer, _summary, buf = _make_renderer()
-    renderer.render({"type": WRAPPER_STALE_WORKTREE_ABORTED})
+    renderer.render(
+        {
+            "type": WRAPPER_CHECKPOINT_RECORDED,
+            "sha": "abcdef0123456789",
+            "issue": 32,
+        }
+    )
     out = buf.getvalue()
-    assert "stale" in out.lower() or "worktree" in out.lower() or "dirty" in out.lower()
+    assert "checkpoint" in out.lower()
+    assert "abcdef0" in out
+    assert "#32" in out
+    # One printed line.
+    assert out.count("\n") <= 2
+
+
+def test_wrapper_checkpoint_recorded_is_not_counted_as_a_commit() -> None:
+    """A Checkpoint must NOT increment the Summary's agent-commit tally."""
+    renderer, summary, _buf = _make_renderer()
+    renderer.render({"type": WRAPPER_ITERATION_START, "iter": 1, "issue": 7})
+    renderer.render(
+        {
+            "type": WRAPPER_COMMIT_RECORDED,
+            "sha": "1111111111111111",
+            "subject": "feat: real agent work",
+        }
+    )
+    renderer.render(
+        {
+            "type": WRAPPER_CHECKPOINT_RECORDED,
+            "sha": "2222222222222222",
+            "issue": 7,
+        }
+    )
+    snap = summary.current
+    assert snap is not None
+    # The agent commit counts; the Checkpoint does not.
+    assert snap.commits == 1
 
 
 def test_wrapper_ask_user_attempted_renders_warning() -> None:

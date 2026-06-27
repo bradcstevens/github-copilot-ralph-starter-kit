@@ -708,8 +708,10 @@ class TestPrdsHandleCompletions:
     def test_does_not_mutate_filesystem(self, tmp_path: Path) -> None:
         """Critical invariant: handle_completions must leave the worktree clean.
 
-        If the wrapper moved files, the next iteration's stale-worktree
-        guard (``git diff --quiet``) would abort the loop.
+        A wrapper-side move would dirty the tree; under ADR-0004 the runner
+        Checkpoint would now capture that rather than abort, but detection-only
+        keeps the PRDs closure attributable to the agent's own ``git mv``
+        commit instead of an anonymous Checkpoint.
         """
         original = tmp_path / "prds" / "featA" / "001-a.md"
         _write_md(original, _AFK_BODY)

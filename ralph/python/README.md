@@ -82,7 +82,6 @@ surface including verbosity flags (`-v`, `-vv`, `-vvv`) and
 | Clean — queue empty   | `0`  | Start of an iteration finds the AFK-ready pool empty.                                                                                                                                                                                              |
 | Clean — iteration cap | `0`  | Positional `<max-iterations>` reached without natural termination.                                                                                                                                                                                |
 | Aborted — stuck       | `1`  | `MAX_NMT_STRIKES` (default 3) consecutive iterations made no progress.                                                                                                                                                                             |
-| Aborted — stale       | `1`  | Working tree was dirty at the start of an iteration.                                                                                                                                                                                               |
 | Aborted — preflight   | `1`  | Pre-loop setup failed: not inside a git repo, `gh` not authed or not on PATH, prompt file missing, malformed `RALPH_PRICING_FILE`, `CopilotClient` construction failed, writers bundle failed, or unknown `ISSUE_SOURCE`. Surfaces cleanly via stderr. |
 
 ---

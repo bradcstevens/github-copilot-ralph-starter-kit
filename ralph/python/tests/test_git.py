@@ -23,8 +23,11 @@ from ralph_afk import git
 from ralph_afk.git import (
     Commit,
     GitError,
+    add_all,
+    commit,
     commits_between,
     current_branch,
+    has_untracked,
     head_sha,
     is_dirty,
     range_count,
@@ -459,3 +462,121 @@ def test_switch_raises_for_missing_branch(tmp_path: Path) -> None:
     _commit(tmp_path, "init")
     with pytest.raises(GitError):
         switch("does-not-exist", tmp_path)
+
+
+# --------------------------------------------------------------------------- #
+# has_untracked / add_all / commit  (issue #32 — runner Checkpoint)           #
+# --------------------------------------------------------------------------- #
+
+
+def test_has_untracked_false_on_clean_tree(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    _commit(tmp_path, "init")
+    assert has_untracked(start=tmp_path) is False
+
+
+def test_has_untracked_true_with_untracked_file(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    _commit(tmp_path, "init")
+    (tmp_path / "new.txt").write_text("nobody added me")
+    assert has_untracked(start=tmp_path) is True
+
+
+def test_has_untracked_false_for_modification_only(tmp_path: Path) -> None:
+    """A modified *tracked* file is dirty, not untracked."""
+    _init_repo(tmp_path)
+    _commit(tmp_path, "init", file_name="a.txt", content="v1")
+    (tmp_path / "a.txt").write_text("v2")
+    assert has_untracked(start=tmp_path) is False
+    assert is_dirty(start=tmp_path) is True
+
+
+def test_has_untracked_honours_gitignore(tmp_path: Path) -> None:
+    """An ignored untracked file does not count (``--exclude-standard``)."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text("ignored/\n*.log\n")
+    _commit(tmp_path, "init", file_name=".gitignore", content="ignored/\n*.log\n")
+    (tmp_path / "ignored").mkdir()
+    (tmp_path / "ignored" / "x.txt").write_text("hidden")
+    (tmp_path / "debug.log").write_text("noise")
+    assert has_untracked(start=tmp_path) is False
+
+
+def test_has_untracked_raises_outside_repo(tmp_path: Path) -> None:
+    with pytest.raises(GitError):
+        has_untracked(start=tmp_path)
+
+
+def test_add_all_stages_modification_and_untracked(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    _commit(tmp_path, "init", file_name="a.txt", content="v1")
+    (tmp_path / "a.txt").write_text("v2")
+    (tmp_path / "b.txt").write_text("brand new")
+
+    add_all(start=tmp_path)
+
+    # Everything is now staged: nothing untracked, and a staged diff exists.
+    assert has_untracked(start=tmp_path) is False
+    staged = subprocess.run(
+        ["git", "-C", str(tmp_path), "diff", "--cached", "--name-only"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    assert sorted(staged) == ["a.txt", "b.txt"]
+
+
+def test_add_all_honours_gitignore(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text("*.log\n")
+    _commit(tmp_path, "init", file_name=".gitignore", content="*.log\n")
+    (tmp_path / "keep.txt").write_text("tracked")
+    (tmp_path / "debug.log").write_text("ignored")
+
+    add_all(start=tmp_path)
+
+    staged = subprocess.run(
+        ["git", "-C", str(tmp_path), "diff", "--cached", "--name-only"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    assert staged == ["keep.txt"]
+
+
+def test_commit_creates_commit_and_returns_head_sha(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    _commit(tmp_path, "init")
+    (tmp_path / "c.txt").write_text("payload")
+    add_all(start=tmp_path)
+
+    sha = commit("a runner checkpoint", start=tmp_path)
+
+    assert sha == head_sha(start=tmp_path)
+    assert len(sha) == 40 and all(ch in "0123456789abcdef" for ch in sha)
+    recorded = recent_commits(1, start=tmp_path)[0]
+    assert recorded.subject == "a runner checkpoint"
+
+
+def test_commit_preserves_multi_paragraph_message(tmp_path: Path) -> None:
+    """Subject + body + trailer paragraphs survive a single ``-m``."""
+    _init_repo(tmp_path)
+    _commit(tmp_path, "init")
+    (tmp_path / "d.txt").write_text("payload")
+    add_all(start=tmp_path)
+
+    message = "Checkpoint subject\n\nA body paragraph.\n\nRalph-Checkpoint: 32"
+    commit(message, start=tmp_path)
+
+    recorded = recent_commits(1, start=tmp_path)[0]
+    assert recorded.subject == "Checkpoint subject"
+    assert "A body paragraph." in recorded.body
+    assert "Ralph-Checkpoint: 32" in recorded.body
+
+
+def test_commit_raises_when_nothing_staged(tmp_path: Path) -> None:
+    """``git commit`` with an empty index exits non-zero -> GitError."""
+    _init_repo(tmp_path)
+    _commit(tmp_path, "init")
+    with pytest.raises(GitError):
+        commit("nothing to do", start=tmp_path)

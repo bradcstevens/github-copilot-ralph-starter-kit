@@ -79,6 +79,11 @@ _STRIKE = "wrapper.strike"
 # same #22 fan-out, so the ledger folds out of them with no new plumbing.
 _AFK_READY_COLLECTED = "wrapper.afk_ready.collected"
 _COMMIT_RECORDED = "wrapper.commit.recorded"
+#: A runner-authored **Checkpoint** (issue #32 / ADR-0004). Folded into the
+#: per-issue Log as a distinct event line but, unlike a commit, it does NOT
+#: increment the iteration's commit tally — Checkpoints never count as agent
+#: progress.
+_CHECKPOINT_RECORDED = "wrapper.checkpoint.recorded"
 _AUTO_CLOSE = "wrapper.auto_close"
 _PR_ADVANCED = "wrapper.pr.advanced"
 _ITERATION_END = "wrapper.iteration.end"
@@ -312,6 +317,10 @@ class LiveRunState:
         elif etype == _COMMIT_RECORDED:
             self._iter_commits += 1
             self._record_event_line(_transcript_commit_text(event))
+        elif etype == _CHECKPOINT_RECORDED:
+            # A runner Checkpoint: a distinct Log line, but NOT a commit — it
+            # must not advance the issue or reset strikes.
+            self._record_event_line(_transcript_checkpoint_text(event))
         elif etype == _AUTO_CLOSE:
             self._record_closure(event.get("issue"), now, status=STATUS_CLOSED)
             self._record_event_line(_transcript_auto_close_text(event))
@@ -752,6 +761,19 @@ def _transcript_commit_text(event: Mapping[str, Any]) -> str:
     if subject:
         lines = str(subject).splitlines()
         text += f"  {lines[0] if lines else str(subject)}"
+    return text
+
+
+def _transcript_checkpoint_text(event: Mapping[str, Any]) -> str:
+    """A runner Checkpoint as a transcript ``event`` line (distinct glyph)."""
+    issue = event.get("issue")
+    short = _short_sha(event)
+    text = "⎘ checkpoint"
+    if short:
+        text += f" {short}"
+    if issue is not None:
+        label = f"#{issue}" if isinstance(issue, int) else str(issue)
+        text += f"  ({label})"
     return text
 
 

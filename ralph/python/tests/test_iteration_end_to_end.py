@@ -51,6 +51,7 @@ from ralph_afk import gh as gh_module
 from ralph_afk import git as git_module
 from ralph_afk import loop as loop_module
 from ralph_afk.config import RunConfig
+from ralph_afk.wrapper import is_checkpoint_message
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +216,7 @@ def test_loop_runs_one_iteration_end_to_end(tmp_path, monkeypatch) -> None:
     # -- 2) git stubs ------------------------------------------------------
     monkeypatch.setattr(git_module, "repo_root", lambda start=None: tmp_path)
     monkeypatch.setattr(git_module, "is_dirty", lambda start=None: False)
+    monkeypatch.setattr(git_module, "has_untracked", lambda start=None: False)
 
     head_sequence = iter(["pre-sha-abc", "post-sha-xyz"])
 
@@ -423,6 +425,7 @@ def test_loop_empty_pool_exits_zero(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(git_module, "repo_root", lambda start=None: tmp_path)
     monkeypatch.setattr(git_module, "is_dirty", lambda start=None: False)
+    monkeypatch.setattr(git_module, "has_untracked", lambda start=None: False)
     monkeypatch.setattr(git_module, "head_sha", lambda start=None: "deadbeef")
     monkeypatch.setattr(git_module, "recent_commits", lambda n, start=None: [])
 
@@ -449,15 +452,29 @@ def test_loop_empty_pool_exits_zero(tmp_path, monkeypatch) -> None:
     assert fake_client.stop_call_count == 1
 
 
-def test_loop_stale_worktree_exits_one(tmp_path, monkeypatch) -> None:
-    """A dirty worktree on iteration 1 aborts with exit code 1."""
+def _wire_single_issue_github(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    issue_number: int = 42,
+) -> FakeCopilotClient:
+    """Minimal github wiring for a one-issue run with no agent commits.
+
+    Sets up the repo on disk, the gh stubs (one AFK-ready issue that is
+    never closed), and a clean head/commit accounting (the agent makes no
+    commit). The caller owns the dirty/untracked + checkpoint stubs so each
+    test can script the Checkpoint path it wants.
+    """
     (tmp_path / "ralph").mkdir()
     (tmp_path / "ralph" / "prompt.md").write_text("be ralph", encoding="utf-8")
 
+    issue = _make_issue(issue_number)
     monkeypatch.setattr(git_module, "repo_root", lambda start=None: tmp_path)
-    monkeypatch.setattr(git_module, "is_dirty", lambda start=None: True)
-    monkeypatch.setattr(git_module, "head_sha", lambda start=None: "deadbeef")
+    monkeypatch.setattr(git_module, "head_sha", lambda start=None: "samesha")
     monkeypatch.setattr(git_module, "recent_commits", lambda n, start=None: [])
+    monkeypatch.setattr(
+        git_module, "commits_between", lambda pre, head, start=None: []
+    )
 
     monkeypatch.setattr(gh_module, "auth_status", lambda: True)
     monkeypatch.setattr(
@@ -465,15 +482,178 @@ def test_loop_stale_worktree_exits_one(tmp_path, monkeypatch) -> None:
         "repo_view",
         lambda: gh_module.Repo(owner="x", name="y", default_branch="main"),
     )
+    monkeypatch.setattr(
+        gh_module, "issue_list", lambda label, state="open": [issue]
+    )
+    monkeypatch.setattr(gh_module, "issue_view", lambda number: issue)
+    monkeypatch.setattr(gh_module, "issue_close", lambda number, comment: None)
 
     fake_client = FakeCopilotClient(scripted_events=[])
     monkeypatch.setattr(loop_module, "_make_client", lambda: fake_client)
+    return fake_client
+
+
+def test_loop_dirty_worktree_checkpoints_and_continues(
+    tmp_path, monkeypatch
+) -> None:
+    """A dirty worktree no longer aborts: it produces one Checkpoint and runs on.
+
+    The stale_worktree abort (ADR-0004) is gone. At the iteration boundary a
+    dirty tree is staged (``add_all``) and captured in a single
+    close-keyword-free Checkpoint commit attributed to the Active issue, then
+    the run completes normally (exit 0). The Checkpoint emits
+    ``wrapper.checkpoint.recorded`` — NOT ``wrapper.commit.recorded`` — so it is
+    not counted as agent progress.
+    """
+    fake_client = _wire_single_issue_github(tmp_path, monkeypatch)
+
+    # Dirty tracked files at the iteration boundary; no untracked files.
+    monkeypatch.setattr(git_module, "is_dirty", lambda start=None: True)
+    monkeypatch.setattr(git_module, "has_untracked", lambda start=None: False)
+
+    add_all_calls: list[Any] = []
+    commit_messages: list[str] = []
+
+    def fake_add_all(start: Any = None) -> None:
+        add_all_calls.append(start)
+
+    def fake_commit(message: str, start: Any = None) -> str:
+        commit_messages.append(message)
+        return "cap0000000000000000000000000000000000000"
+
+    monkeypatch.setattr(git_module, "add_all", fake_add_all)
+    monkeypatch.setattr(git_module, "commit", fake_commit)
+
+    cfg = RunConfig(issue_source="github", max_iterations=1, max_nmt_strikes=3)
+    exit_code = asyncio.run(loop_module.run(cfg))
+
+    # The dirty tree did NOT abort the run.
+    assert exit_code == 0
+    assert len(fake_client.created) == 1, "the SDK session still ran"
+
+    # Exactly one Checkpoint: stage everything, then one commit.
+    assert add_all_calls, "the worktree must be staged before the Checkpoint"
+    assert len(commit_messages) == 1, (
+        f"expected exactly one Checkpoint commit; got {commit_messages}"
+    )
+    msg = commit_messages[0]
+    assert is_checkpoint_message(msg), "Checkpoint must carry the trailer"
+    assert "42" in msg, "Checkpoint is attributed to the Active issue #42"
+
+    # The Checkpoint surfaced as wrapper.checkpoint.recorded, never as a commit.
+    logs_dir = tmp_path / ".ralph" / "logs"
+    log_lines = next(logs_dir.glob("*.jsonl")).read_text(
+        encoding="utf-8"
+    ).splitlines()
+    types_seen = [json.loads(raw)["type"] for raw in log_lines]
+    assert "wrapper.checkpoint.recorded" in types_seen
+    assert "wrapper.commit.recorded" not in types_seen
+    assert "wrapper.stale_worktree.aborted" not in types_seen
+
+    # The persisted iteration counts no agent commits for the Checkpoint.
+    runs_dir = tmp_path / ".ralph" / "runs"
+    payload = json.loads(next(runs_dir.glob("*.json")).read_text(encoding="utf-8"))
+    assert payload["iterations"][0]["commits"] == 0
+
+
+def test_loop_clean_worktree_makes_no_checkpoint(tmp_path, monkeypatch) -> None:
+    """A clean (neither dirty nor untracked) worktree never authors a Checkpoint."""
+    _wire_single_issue_github(tmp_path, monkeypatch)
+    monkeypatch.setattr(git_module, "is_dirty", lambda start=None: False)
+    monkeypatch.setattr(git_module, "has_untracked", lambda start=None: False)
+
+    commit_calls: list[str] = []
+    monkeypatch.setattr(
+        git_module, "add_all", lambda start=None: None
+    )
+    monkeypatch.setattr(
+        git_module,
+        "commit",
+        lambda message, start=None: commit_calls.append(message) or "x",
+    )
 
     cfg = RunConfig(issue_source="github", max_iterations=1)
     exit_code = asyncio.run(loop_module.run(cfg))
 
+    assert exit_code == 0
+    assert commit_calls == [], "a clean worktree must not be checkpointed"
+    logs_dir = tmp_path / ".ralph" / "logs"
+    log_lines = next(logs_dir.glob("*.jsonl")).read_text(
+        encoding="utf-8"
+    ).splitlines()
+    types_seen = [json.loads(raw)["type"] for raw in log_lines]
+    assert "wrapper.checkpoint.recorded" not in types_seen
+
+
+def test_checkpoint_is_excluded_from_strikes_abort_after_n_still_fires(
+    tmp_path, monkeypatch
+) -> None:
+    """Checkpoints never reset strikes: a stuck agent still aborts after N.
+
+    Every iteration the agent makes no commit (no progress) but leaves a dirty
+    tree, so the runner Checkpoints each time. Because Checkpoints are excluded
+    from Strike progress, the no-progress strikes still accumulate and the
+    abort-after-N protection fires (exit 1) — the durability net did not mask a
+    genuinely stuck agent.
+    """
+    fake_client = _wire_single_issue_github(tmp_path, monkeypatch)
+    monkeypatch.setattr(git_module, "is_dirty", lambda start=None: True)
+    monkeypatch.setattr(git_module, "has_untracked", lambda start=None: False)
+
+    commit_count = {"n": 0}
+
+    def fake_commit(message: str, start: Any = None) -> str:
+        commit_count["n"] += 1
+        return f"cap{commit_count['n']:040d}"
+
+    monkeypatch.setattr(git_module, "add_all", lambda start=None: None)
+    monkeypatch.setattr(git_module, "commit", fake_commit)
+
+    cfg = RunConfig(
+        issue_source="github", max_iterations=10, max_nmt_strikes=2
+    )
+    exit_code = asyncio.run(loop_module.run(cfg))
+
+    # Abort-after-N still fires despite every iteration being Checkpointed.
     assert exit_code == 1
-    assert len(fake_client.created) == 0
+    # Two iterations to reach the 2-strike threshold, one Checkpoint each.
+    assert commit_count["n"] == 2, (
+        f"expected one Checkpoint per stuck iteration; got {commit_count['n']}"
+    )
+    assert len(fake_client.created) == 2
+
+
+def test_checkpoint_failure_is_non_fatal(tmp_path, monkeypatch) -> None:
+    """A Checkpoint commit failure warns but never aborts the run.
+
+    A local-only repo (no remote) or a transient git error during the
+    Checkpoint must not take down the loop — the iteration completes and the
+    run exits normally.
+    """
+    _wire_single_issue_github(tmp_path, monkeypatch)
+    monkeypatch.setattr(git_module, "is_dirty", lambda start=None: True)
+    monkeypatch.setattr(git_module, "has_untracked", lambda start=None: False)
+    monkeypatch.setattr(git_module, "add_all", lambda start=None: None)
+
+    def boom(message: str, start: Any = None) -> str:
+        raise git_module.GitError(["git", "commit"], 1, "nothing to commit")
+
+    monkeypatch.setattr(git_module, "commit", boom)
+
+    cfg = RunConfig(issue_source="github", max_iterations=1, max_nmt_strikes=3)
+    exit_code = asyncio.run(loop_module.run(cfg))
+
+    # The failed Checkpoint did not abort the run.
+    assert exit_code == 0
+    logs_dir = tmp_path / ".ralph" / "logs"
+    log_lines = next(logs_dir.glob("*.jsonl")).read_text(
+        encoding="utf-8"
+    ).splitlines()
+    types_seen = [json.loads(raw)["type"] for raw in log_lines]
+    # No checkpoint event was emitted (the commit failed before emit).
+    assert "wrapper.checkpoint.recorded" not in types_seen
+    # And crucially the run reached its clean end.
+    assert "wrapper.run.end" in types_seen
 
 
 def test_loop_prds_end_to_end_one_iteration(tmp_path, monkeypatch) -> None:
@@ -529,6 +709,7 @@ def test_loop_prds_end_to_end_one_iteration(tmp_path, monkeypatch) -> None:
     # -- 2) git stubs ------------------------------------------------------
     monkeypatch.setattr(git_module, "repo_root", lambda start=None: tmp_path)
     monkeypatch.setattr(git_module, "is_dirty", lambda start=None: False)
+    monkeypatch.setattr(git_module, "has_untracked", lambda start=None: False)
     head_sequence = iter(["pre-sha-prds", "post-sha-prds"])
     monkeypatch.setattr(
         git_module, "head_sha", lambda start=None: next(head_sequence)
@@ -702,6 +883,7 @@ def test_loop_prds_empty_pool_exits_zero(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(git_module, "repo_root", lambda start=None: tmp_path)
     monkeypatch.setattr(git_module, "is_dirty", lambda start=None: False)
+    monkeypatch.setattr(git_module, "has_untracked", lambda start=None: False)
     monkeypatch.setattr(git_module, "head_sha", lambda start=None: "deadbeef")
     monkeypatch.setattr(git_module, "recent_commits", lambda n, start=None: [])
 
@@ -755,6 +937,7 @@ def test_loop_aborts_after_max_nmt_strikes(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(git_module, "repo_root", lambda start=None: tmp_path)
     monkeypatch.setattr(git_module, "is_dirty", lambda start=None: False)
+    monkeypatch.setattr(git_module, "has_untracked", lambda start=None: False)
     monkeypatch.setattr(git_module, "head_sha", lambda start=None: "deadbeef")
     monkeypatch.setattr(git_module, "recent_commits", lambda n, start=None: [])
     monkeypatch.setattr(
@@ -810,6 +993,7 @@ def test_loop_send_and_wait_exception_is_no_progress(tmp_path, monkeypatch) -> N
 
     monkeypatch.setattr(git_module, "repo_root", lambda start=None: tmp_path)
     monkeypatch.setattr(git_module, "is_dirty", lambda start=None: False)
+    monkeypatch.setattr(git_module, "has_untracked", lambda start=None: False)
     monkeypatch.setattr(git_module, "head_sha", lambda start=None: "deadbeef")
     monkeypatch.setattr(git_module, "recent_commits", lambda n, start=None: [])
     monkeypatch.setattr(
@@ -871,6 +1055,7 @@ def test_loop_auto_close_failure_does_not_abort_iteration(tmp_path, monkeypatch)
 
     monkeypatch.setattr(git_module, "repo_root", lambda start=None: tmp_path)
     monkeypatch.setattr(git_module, "is_dirty", lambda start=None: False)
+    monkeypatch.setattr(git_module, "has_untracked", lambda start=None: False)
     head_sequence = iter(["pre", "post"])
     monkeypatch.setattr(git_module, "head_sha", lambda start=None: next(head_sequence))
     monkeypatch.setattr(git_module, "recent_commits", lambda n, start=None: [])
@@ -981,6 +1166,7 @@ def test_loop_multiple_iterations_until_cap(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(git_module, "repo_root", lambda start=None: tmp_path)
     monkeypatch.setattr(git_module, "is_dirty", lambda start=None: False)
+    monkeypatch.setattr(git_module, "has_untracked", lambda start=None: False)
     head_counter = {"i": 0}
 
     def fake_head_sha(start: Any = None) -> str:
@@ -1090,6 +1276,7 @@ def test_loop_emits_otel_span_tree_when_enabled(tmp_path, monkeypatch) -> None:
     # -- 2) git stubs ------------------------------------------------------
     monkeypatch.setattr(git_module, "repo_root", lambda start=None: tmp_path)
     monkeypatch.setattr(git_module, "is_dirty", lambda start=None: False)
+    monkeypatch.setattr(git_module, "has_untracked", lambda start=None: False)
 
     head_sequence = iter(["pre-sha-abc", "post-sha-xyz"])
 
@@ -1272,6 +1459,7 @@ def test_loop_pr_advance_emits_pr_advanced_event(tmp_path, monkeypatch) -> None:
     # -- git stubs --------------------------------------------------------
     monkeypatch.setattr(git_module, "repo_root", lambda start=None: tmp_path)
     monkeypatch.setattr(git_module, "is_dirty", lambda start=None: False)
+    monkeypatch.setattr(git_module, "has_untracked", lambda start=None: False)
     # Head SHA constant: no base-branch commit this iteration.
     monkeypatch.setattr(git_module, "head_sha", lambda start=None: "base-sha")
     monkeypatch.setattr(
