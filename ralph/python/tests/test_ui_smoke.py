@@ -56,6 +56,7 @@ from ralph_afk.events import (
 from ralph_afk.pricing import ModelPricing, Pricing
 from ralph_afk.ui import IterationSnapshot, Renderer, RunSummary, get_console
 from ralph_afk.ui.console import STYLES
+from ralph_afk.usage import UsageTally
 
 
 # ---------------------------------------------------------------------------
@@ -952,9 +953,11 @@ def test_iteration_snapshot_to_counters_kwargs_conversion() -> None:
         issue_num=42,
         started_at=_ts(),
         ended_at=datetime(2026, 5, 16, 0, 0, 30, tzinfo=timezone.utc),
-        model="claude-opus-4.7-xhigh",
-        tokens_in=1000,
-        tokens_out=200,
+        usage=UsageTally(
+            model="claude-opus-4.7-xhigh",
+            tokens_in=1000,
+            tokens_out=200,
+        ),
         tool_count=3,
         skill_count=1,
         commits=1,
@@ -991,12 +994,40 @@ def test_iteration_snapshot_to_counters_kwargs_unknown_model_yields_none_cost() 
         iter_num=1,
         started_at=_ts(),
         ended_at=_ts(),
-        model="unknown-model",
-        tokens_in=100,
-        tokens_out=20,
+        usage=UsageTally(model="unknown-model", tokens_in=100, tokens_out=20),
     )
     kwargs = snap.to_counters_kwargs(pricing=_fixed_pricing())
     assert kwargs["est_cost_usd"] is None
+
+
+def test_iteration_snapshot_embeds_usage_tally_and_delegates() -> None:
+    """#40: an IterationSnapshot's Consumption lives in a shared ``UsageTally``.
+
+    The per-iteration accrual rule (*first non-None model wins; tokens sum*) and
+    the unknown-model cost guard are the ``UsageTally``'s — not a second copy in
+    ``summary.py``. ``record_usage`` folds through :meth:`UsageTally.add`, and
+    ``context_used`` / ``cost_usd`` read straight off the tally.
+    """
+    # The snapshot carries a real UsageTally, default-constructed.
+    snap = IterationSnapshot(iter_num=1)
+    assert isinstance(snap.usage, UsageTally)
+
+    summary = RunSummary(pricing=_fixed_pricing())
+    summary.on_iteration_start(iter_num=1, issue_num=7)
+    # A leading None model, then the authoritative model, then a *different*
+    # non-None model that must NOT overwrite it (first non-None wins absolutely).
+    summary.record_usage(model=None, tokens_in=10, tokens_out=5)
+    summary.record_usage(model="claude-opus-4.7-xhigh", tokens_in=20, tokens_out=5)
+    summary.record_usage(model="gpt-5.4", tokens_in=1, tokens_out=1)
+    cur = summary.current
+    assert cur is not None
+    # The rule now lives solely in the tally.
+    assert cur.usage.model == "claude-opus-4.7-xhigh"
+    assert cur.usage.tokens_in == 31
+    assert cur.usage.tokens_out == 11
+    # context_used / cost_usd delegate to the tally (no independent arithmetic).
+    assert cur.context_used == cur.usage.total_tokens == 42
+    assert cur.cost_usd(_fixed_pricing()) == cur.usage.cost(_fixed_pricing())
 
 
 # ---------------------------------------------------------------------------
@@ -1394,6 +1425,10 @@ _ALLOWED_UI_IMPORTS: frozenset[str] = frozenset(
         # First-party deep modules
         "ralph_afk.events",
         "ralph_afk.pricing",
+        # ralph_afk.usage — the shared Consumption value object (issue #40).
+        # Deep and pure (stdlib + ralph_afk.pricing); summary.py folds its
+        # per-Iteration Consumption onto it. Not a shell/CLI/persist coupling.
+        "ralph_afk.usage",
     }
 )
 

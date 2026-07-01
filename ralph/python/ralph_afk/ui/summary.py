@@ -27,19 +27,23 @@ Design notes:
   may grow over time) from forcing UI redraws. The
   :meth:`IterationSnapshot.to_counters` method is the deterministic
   conversion seam.
-* **First non-None model wins.** Some SDK versions emit ``usage.tokens``
-  events with ``model=None``; the snapshot retains the first authoritative
-  model name and ignores subsequent ``None``s. A later non-``None`` model
-  ALSO does not overwrite — keeps the iteration's recorded model stable
-  even if the SDK changes models mid-iteration (which would be unusual
-  but not crashy).
+* **First non-None model wins — via the shared UsageTally.** Some SDK
+  versions emit ``usage.tokens`` events with ``model=None``; the tally
+  retains the first authoritative model name and ignores subsequent
+  ``None``s. A later non-``None`` model ALSO does not overwrite — keeps the
+  iteration's recorded model stable even if the SDK changes models
+  mid-iteration (which would be unusual but not crashy). That rule (and the
+  unknown-model cost guard) is now the :class:`~ralph_afk.usage.UsageTally`'s
+  single implementation, shared with the Queue's per-issue sink — no second
+  copy lives here.
 * **Strikes are cumulative-aware.** A ``WRAPPER_STRIKE`` event carrying
   a ``strikes`` integer is used verbatim (the value is the wrapper's
   authoritative count after the iteration). Absent that key, each
   STRIKE event increments the counter — a marker form for diagnostic
   use.
-* **context_used = tokens_in + tokens_out.** Matches the schema example
-  in :mod:`ralph_afk.persist`. Labelled as "observed tokens" in the
+* **context_used = tokens_in + tokens_out.** Read straight off the tally
+  (:attr:`~ralph_afk.usage.UsageTally.total_tokens`); matches the schema
+  example in :mod:`ralph_afk.persist`. Labelled as "observed tokens" in the
   rendered panel so the operator doesn't read it as live model
   context-window pressure.
 """
@@ -56,7 +60,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from ralph_afk.pricing import Pricing, context_utilisation, estimate_cost
+from ralph_afk.pricing import Pricing, context_utilisation
+from ralph_afk.usage import UsageTally
 
 from .console import STYLES
 
@@ -83,16 +88,18 @@ class IterationSnapshot:
 
     Fields parallel the persist schema where they overlap but include
     extra UI-only fields (``issue_num``, timestamps) that don't belong
-    in the persisted JSON.
+    in the persisted JSON. The per-iteration **Consumption** (tokens + the
+    model they were billed against) lives in a shared
+    :class:`~ralph_afk.usage.UsageTally`; ``model`` / ``tokens_in`` /
+    ``tokens_out`` remain as thin read-only accessors onto it so existing
+    render call sites and the persist seam read unchanged.
     """
 
     iter_num: int
     issue_num: Optional[int] = None
     started_at: Optional[datetime] = None
     ended_at: Optional[datetime] = None
-    model: Optional[str] = None
-    tokens_in: int = 0
-    tokens_out: int = 0
+    usage: UsageTally = field(default_factory=UsageTally)
     tool_count: int = 0
     skill_count: int = 0
     commits: int = 0
@@ -100,15 +107,31 @@ class IterationSnapshot:
     strikes: int = 0
 
     @property
+    def model(self) -> Optional[str]:
+        """The model this iteration's **Consumption** was billed against."""
+        return self.usage.model
+
+    @property
+    def tokens_in(self) -> int:
+        """Input tokens observed this iteration."""
+        return self.usage.tokens_in
+
+    @property
+    def tokens_out(self) -> int:
+        """Output tokens observed this iteration."""
+        return self.usage.tokens_out
+
+    @property
     def context_used(self) -> int:
         """Observed-tokens proxy for context occupancy.
 
-        Sum of input + output tokens within this iteration. Labelled
+        Sum of input + output tokens within this iteration (delegated to
+        :attr:`~ralph_afk.usage.UsageTally.total_tokens`). Labelled
         "observed tokens" in the rendered panel; not a true live
         model-context measurement (multiple turns within a session would
         double-count input tokens, which already include prior history).
         """
-        return self.tokens_in + self.tokens_out
+        return self.usage.total_tokens
 
     @property
     def duration_seconds(self) -> float:
@@ -118,10 +141,12 @@ class IterationSnapshot:
         return (self.ended_at - self.started_at).total_seconds()
 
     def cost_usd(self, pricing: Pricing) -> Optional[Decimal]:
-        """Compute the iteration's estimated cost, or ``None`` for unknown model."""
-        if self.model is None:
-            return None
-        return estimate_cost(self.model, self.tokens_in, self.tokens_out, pricing)
+        """Compute the iteration's estimated cost, or ``None`` for unknown model.
+
+        Delegates to :meth:`~ralph_afk.usage.UsageTally.cost`, which carries
+        the ``None``/unknown-model guard so callers render the em dash.
+        """
+        return self.usage.cost(pricing)
 
     def to_counters_kwargs(self, *, pricing: Pricing) -> dict:
         """Return a kwargs dict suitable for constructing
@@ -144,9 +169,9 @@ class IterationSnapshot:
         return {
             "iter": self.iter_num,
             "duration_seconds": self.duration_seconds,
-            "model": self.model,
-            "tokens_in": self.tokens_in,
-            "tokens_out": self.tokens_out,
+            "model": self.usage.model,
+            "tokens_in": self.usage.tokens_in,
+            "tokens_out": self.usage.tokens_out,
             "context_used": self.context_used,
             "est_cost_usd": self.cost_usd(pricing),
             "tool_count": self.tool_count,
@@ -244,12 +269,10 @@ class RunSummary:
         snap = self.current
         if snap is None:
             return
-        # First non-None model wins — preserves the iteration's authoritative
-        # model name even if a later usage event carries None.
-        if snap.model is None and model is not None:
-            snap.model = model
-        snap.tokens_in += int(tokens_in or 0)
-        snap.tokens_out += int(tokens_out or 0)
+        # Fold this usage sample into the iteration's shared UsageTally. The
+        # accrual rule (first non-None model wins; tokens sum) lives entirely in
+        # UsageTally.add; the sink keeps its own int(x or 0) input sanitization.
+        snap.usage.add(model, int(tokens_in or 0), int(tokens_out or 0))
 
     def record_tool_call(self, *, tool_name: str) -> None:
         snap = self.current
