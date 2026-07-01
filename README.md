@@ -67,9 +67,9 @@ $EDITOR ralph/PROMPT.md  # loop-specific routing rules (usually leave defaults)
 copilot
 > /intake              # optional Phase 0: capture raw/messy/multiple change
 #                        requests (plus terminal output or screenshots) into a
-#                        grill-ready docs/feature-requests/<timestamp>/FEATURE-REQUESTS.md
+#                        grill-ready docs/feature-requests/<timestamp>-<slug>/<slug>.md
 > /grill-me            # greenfield: start here, until 3–4 terms keep recurring
-#                        (optionally point it at the FEATURE-REQUESTS.md /intake produced)
+#                        (optionally point it at the feature-requests file /intake produced)
 # Once vocabulary stabilises, switch to /grill-with-docs to compile it into
 # CONTEXT.md + docs/adr/. See docs/workflow.md for the deciding axis.
 # ...then /to-prd, /to-issues, /triage, then kick off the AFK loop.

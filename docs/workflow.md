@@ -27,7 +27,7 @@ copilot
 > /intake
 ```
 
-It writes `docs/feature-requests/<timestamp>/FEATURE-REQUESTS.md` (with a `context/` folder for any
+It writes `docs/feature-requests/<timestamp>-<slug>/<slug>.md` (with a `context/` folder for any
 attachments) and hands you the path to feed into the next phase. It is **capture-only** — it does
 not walk the design tree or touch `CONTEXT.md`/ADRs; that's the grill phase's job. Skip it if you
 already know exactly what you want and prefer to start grilling directly.

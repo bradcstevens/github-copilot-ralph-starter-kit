@@ -1,11 +1,11 @@
 ---
 name: intake
-description: Interactively capture raw feature/change requests for a project and write a grill-ready FEATURE-REQUESTS.md from the bundled template. Use this BEFORE /grill-me or /grill-with-docs — whenever the user wants to collect, jot down, or stage one or more change requests, feature ideas, bug reports, or "things I want done" for a project, especially when they have several requests, messy/half-formed wording, or supporting material like terminal output or screenshots to attach. Reach for this skill any time the user says they want to write up, capture, intake, or gather feature requests to feed into a grilling/planning session.
+description: Interactively capture raw feature/change requests for a project and write a grill-ready feature-requests markdown file from the bundled template. Use this BEFORE /grill-me or /grill-with-docs — whenever the user wants to collect, jot down, or stage one or more change requests, feature ideas, bug reports, or "things I want done" for a project, especially when they have several requests, messy/half-formed wording, or supporting material like terminal output or screenshots to attach. Reach for this skill any time the user says they want to write up, capture, intake, or gather feature requests to feed into a grilling/planning session.
 ---
 
 This skill runs a short **intake interview**: it collects raw change requests from the user,
 splits and tidies them, attaches any supporting context, and writes a single
-`FEATURE-REQUESTS.md` that the grill skills consume as their starting brief.
+per-run feature-requests markdown file that the grill skills consume as their starting brief.
 
 ## What this skill is NOT
 
@@ -18,19 +18,47 @@ work?", stop — that question belongs to the grill phase.
 
 ## Output location
 
-Write to a fresh per-run folder so each intake session is a self-contained brief:
+Write to a fresh per-run folder so each intake session is a self-contained brief. The folder and
+its markdown file are **both** named with the batch's date/time **and** a descriptive theme
+`<slug>`, so a human scanning `docs/feature-requests/` sees *when* a batch was captured and *what
+it's about* without opening anything:
 
 ```
-docs/feature-requests/<YYYY-MM-DD-HHMMSS>/
-├── FEATURE-REQUESTS.md      ← generated from the template below
+docs/feature-requests/<YYYY-MM-DD-HHMMSS>-<slug>/
+├── <slug>.md                ← generated from the template below
 └── context/                 ← copied attachments (created only if needed)
 ```
 
-- Use a sortable UTC-ish timestamp, e.g. `2026-05-29-143022`. Get it with `date -u +%Y-%m-%d-%H%M%S`.
-- If that folder already exists (two runs in the same second), append `-2`, `-3`, … .
+- **Timestamp:** a sortable UTC-ish stamp that keeps runs in chronological order, e.g.
+  `2026-05-29-143022`. Get it with `date -u +%Y-%m-%d-%H%M%S`.
+- **Slug:** a short, human-readable name for *what this batch is about* — see [Naming the slug](#naming-the-slug).
+- Because the slug reflects the whole batch, finalize it (and create the folder) once you've
+  gathered every request — i.e. at the added-context step — not at the start of the interview.
+- If that folder already exists (same second *and* same slug), append `-2`, `-3`, … to the folder name.
 - If `docs/` doesn't exist, create the full path anyway — don't error.
 - Per-run folders (not one growing file) keep each grill session pointed at one coherent batch
   and stop stale and active requests from mixing.
+
+### Naming the slug
+
+The slug is what makes a batch legible at a glance, so name it for the *content*, never generically:
+
+- **One request:** name it after that single request, e.g. `stream-issue-log-to-bottom`.
+- **Multiple requests:** name it after the **core / general theme** that ties them together — e.g.
+  `copiloop-packaging-and-rebrand` for a batch spanning packaging, distribution, config, and a
+  rename. Find the umbrella; don't just concatenate every request. If the requests are genuinely
+  unrelated, pick the dominant area.
+- Derive it from the **refined request titles**, not the user's verbatim wording.
+
+**Format — lowercase kebab-case (alphanumeric words joined by single hyphens):**
+
+- Lowercase everything; keep only `a-z`, `0-9`, and `-`.
+- Replace spaces, underscores, and slashes with `-`; drop all other punctuation.
+- Collapse repeated hyphens and trim any leading/trailing hyphen.
+- Keep it tight: 2-6 words, 50 characters or fewer. Drop filler words (`the`, `a`, `please`).
+
+Use this exact slug for **both** the folder suffix and the markdown filename, e.g.
+`docs/feature-requests/2026-05-29-143022-stream-issue-log-to-bottom/stream-issue-log-to-bottom.md`.
 
 ## The template
 
@@ -47,7 +75,7 @@ is here to dump requests, not read essays.
 
 Briefly say what you'll do, then ask for their first request:
 
-> "I'll capture your change requests into a FEATURE-REQUESTS.md you can feed into `/grill-me`
+> "I'll capture your change requests into a feature-requests file you can feed into `/grill-me`
 > or `/grill-with-docs`. What's the first thing you'd like changed?"
 
 ### 2. Process each request as it comes in
@@ -105,7 +133,7 @@ items become that request's `**Context:**` link.
 
 ## Write the file
 
-Render the template into `docs/feature-requests/<timestamp>/FEATURE-REQUESTS.md`. Set the
+Render the template into `docs/feature-requests/<timestamp>-<slug>/<slug>.md`. Set the
 generated-on timestamp, fill `## Project context` from what you learned (or infer one line from
 the repo and keep it short), and ensure every `**Context:**` link resolves to a file actually
 present in `context/`.
@@ -114,5 +142,5 @@ present in `context/`.
 
 Finish with a copy-pasteable next step — and nothing more (don't start grilling):
 
-> "Captured N request(s) → `docs/feature-requests/<timestamp>/FEATURE-REQUESTS.md`.
+> "Captured N request(s) → `docs/feature-requests/<timestamp>-<slug>/<slug>.md`.
 > Next: run `/grill-me` (greenfield) or `/grill-with-docs` and point it at that file."
