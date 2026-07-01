@@ -4,15 +4,17 @@ Created for issue #46 (the ``git`` seam) and extended in #47 (the ``gh`` seam).
 A *fake* is a working in-memory implementation of a Protocol seam — richer than
 a one-off stub — so a test substitutes a single object instead of monkeypatching
 a dozen module functions. Each fake satisfies its Protocol structurally:
-``isinstance(fake, GitClient)`` holds because the Protocols are
-``@runtime_checkable``.
+``isinstance(fake, GitClient)`` / ``isinstance(fake, GitHubClient)`` hold because
+the Protocols are ``@runtime_checkable``.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
+from ralph_afk.gh import GhError, Issue, PullRequest, Repo
 from ralph_afk.git import Commit, GitError
 
 
@@ -195,3 +197,168 @@ class FakeGitClient:
         )
         self._log.append(commit)
         return commit.sha
+
+
+def _state_matches(actual: str, wanted: str) -> bool:
+    """Match a stored ``state`` against a ``gh ... list --state`` filter value.
+
+    ``gh`` accepts ``all`` (everything) plus case-insensitive lifecycle states
+    (``open`` / ``closed``, and ``merged`` for PRs). Stored states are upper-case
+    (``"OPEN"`` / ``"CLOSED"`` / ``"MERGED"``, matching the value objects).
+    """
+    if wanted == "all":
+        return True
+    return actual.upper() == wanted.upper()
+
+
+class FakeGitHubClient:
+    """Stateful in-memory :class:`~ralph_afk.gh.GitHubClient` for source/loop tests.
+
+    Extends the seam pattern #46 established for ``git`` to GitHub (#47). Models a
+    per-number **store** of issues and pull requests so the read methods
+    (:meth:`issue_list` / :meth:`issue_view` / :meth:`pr_list` / :meth:`pr_view`)
+    stay consistent by construction, records the mutating :meth:`issue_close` for
+    assertions, and injects per-method :exc:`~ralph_afk.gh.GhError` failures so a
+    test drives the source's resilience paths without monkeypatching. The ~57
+    monkeypatch lines the sources tests used to carry collapse into constructing
+    one of these.
+
+    **issue_close is a recorded mechanic, never a policy.** It appends to
+    :attr:`issue_close_calls` and flips the stored issue's ``state`` to
+    ``"CLOSED"`` (so a later :meth:`issue_view` sees the close land, exactly as
+    the real ``gh`` does) — it does *not* decide whether the closure counts as
+    **Strike** progress or interpret close-keywords. That policy stays in
+    :class:`ralph_afk.sources.GitHubIssueSource`, never in the client.
+
+    **List and single-view are independently scriptable.** ``issue_list`` /
+    ``pr_list`` return the seeded stores (filtered by state); ``issue_view`` /
+    ``pr_view`` return the same objects by number *unless* overridden. Pass
+    ``issue_views={n: issue}`` to make :meth:`issue_view` return a *different*
+    body than the list did — this exercises the source's re-verify-on-full-body
+    path (list body carries the discriminator, the full view does not). Per-number
+    ``*_view_errors`` / ``issue_close_errors`` inject a :exc:`~ralph_afk.gh.GhError`
+    for one number while the rest of the pool proceeds (the source's resilience
+    paths); the whole-operation ``auth_status_error`` / ``repo_view_error`` /
+    ``issue_list_error`` / ``pr_list_error`` fail a list/preflight call outright.
+
+    Unlike :class:`FakeGitClient` there is **no root / cwd binding** — ``gh`` runs
+    in the process cwd — so the constructor takes no ``root`` and the methods keep
+    their real signatures.
+    """
+
+    def __init__(
+        self,
+        *,
+        authed: bool = True,
+        repo: Repo | None = None,
+        issues: Sequence[Issue] = (),
+        prs: Sequence[PullRequest] = (),
+        issue_views: Mapping[int, Issue] | None = None,
+        auth_status_error: GhError | None = None,
+        repo_view_error: GhError | None = None,
+        issue_list_error: GhError | None = None,
+        pr_list_error: GhError | None = None,
+        issue_view_errors: Mapping[int, GhError] | None = None,
+        issue_close_errors: Mapping[int, GhError] | None = None,
+        pr_view_errors: Mapping[int, GhError] | None = None,
+    ) -> None:
+        self.authed = authed
+        self.repo = (
+            repo if repo is not None else Repo(owner="octo", name="kit", default_branch="main")
+        )
+        # Backing stores keyed by number (insertion order preserved for *_list).
+        self._issues: dict[int, Issue] = {issue.number: issue for issue in issues}
+        self._prs: dict[int, PullRequest] = {pr.number: pr for pr in prs}
+        # Optional per-number single-view overrides (diverge view from list).
+        self._issue_views: dict[int, Issue] = dict(issue_views or {})
+        # Whole-operation injected failures (None = the happy path).
+        self.auth_status_error = auth_status_error
+        self.repo_view_error = repo_view_error
+        self.issue_list_error = issue_list_error
+        self.pr_list_error = pr_list_error
+        # Per-number injected failures (a single item fails; the pool proceeds).
+        self._issue_view_errors: dict[int, GhError] = dict(issue_view_errors or {})
+        self._issue_close_errors: dict[int, GhError] = dict(issue_close_errors or {})
+        self._pr_view_errors: dict[int, GhError] = dict(pr_view_errors or {})
+        # Read/write spies.
+        self.issue_list_calls: list[tuple[str, str]] = []
+        self.issue_view_calls: list[int] = []
+        self.issue_close_calls: list[tuple[int, str]] = []
+        self.pr_list_calls: list[tuple[str, str]] = []
+        self.pr_view_calls: list[int] = []
+
+    # -- GitHubClient mechanics -------------------------------------------
+
+    def auth_status(self) -> bool:
+        if self.auth_status_error is not None:
+            raise self.auth_status_error
+        return self.authed
+
+    def repo_view(self) -> Repo:
+        if self.repo_view_error is not None:
+            raise self.repo_view_error
+        return self.repo
+
+    def issue_list(self, label: str, state: str = "open") -> list[Issue]:
+        self.issue_list_calls.append((label, state))
+        if self.issue_list_error is not None:
+            raise self.issue_list_error
+        return [issue for issue in self._issues.values() if _state_matches(issue.state, state)]
+
+    def issue_view(self, number: int) -> Issue:
+        self.issue_view_calls.append(number)
+        err = self._issue_view_errors.get(number)
+        if err is not None:
+            raise err
+        if number in self._issue_views:
+            return self._issue_views[number]
+        try:
+            return self._issues[number]
+        except KeyError:
+            raise GhError(
+                ["gh", "issue", "view", str(number)],
+                1,
+                f"issue #{number} not found",
+            ) from None
+
+    def issue_close(self, number: int, comment: str) -> None:
+        self.issue_close_calls.append((number, comment))
+        err = self._issue_close_errors.get(number)
+        if err is not None:
+            raise err
+        existing = self._issues.get(number)
+        if existing is not None:
+            self._issues[number] = replace(existing, state="CLOSED")
+
+    def pr_list(self, label: str, state: str = "open") -> list[PullRequest]:
+        self.pr_list_calls.append((label, state))
+        if self.pr_list_error is not None:
+            raise self.pr_list_error
+        return [pr for pr in self._prs.values() if _state_matches(pr.state, state)]
+
+    def pr_view(self, number: int) -> PullRequest:
+        self.pr_view_calls.append(number)
+        err = self._pr_view_errors.get(number)
+        if err is not None:
+            raise err
+        try:
+            return self._prs[number]
+        except KeyError:
+            raise GhError(
+                ["gh", "pr", "view", str(number)],
+                1,
+                f"pr #{number} not found",
+            ) from None
+
+    # -- test scripting ----------------------------------------------------
+
+    def set_pr_head(self, number: int, head_sha: str) -> None:
+        """Advance a stored PR's ``head_sha`` (models an agent push to the branch).
+
+        The PR analogue of :meth:`FakeGitClient.simulate_agent_commit`: drive it
+        from the SDK stub's ``on_send`` hook so the head advances *between* the
+        loop's collection-time :meth:`pr_view` (the baseline SHA captured for the
+        brief) and the post-iteration advance-check :meth:`pr_view`, so
+        ``_detect_pr_advances`` sees the branch move.
+        """
+        self._prs[number] = replace(self._prs[number], head_sha=head_sha)

@@ -257,18 +257,30 @@ class GitHubIssueSource:
     """
 
     def __init__(
-        self, diag: logging.Logger, *, include_prs: bool = False
+        self,
+        diag: logging.Logger,
+        *,
+        gh: gh_module.GitHubClient,
+        include_prs: bool = False,
     ) -> None:
         """Construct a backend that logs diagnostics via ``diag``.
 
         Args:
             diag: Diagnostics logger.
+            gh: The injected :class:`ralph_afk.gh.GitHubClient` seam — the raw
+                GitHub mechanics (list / view / close). Production wiring injects
+                a :class:`ralph_afk.gh.SubprocessGitHubClient` (via
+                :func:`ralph_afk.loop._make_github_client`); the sources tests
+                substitute ``tests.fakes.FakeGitHubClient``. The source owns the
+                closure **policy** (what counts as **Strike** progress); the
+                client only provides mechanics.
             include_prs: When ``True``, ``ready-for-agent`` pull requests with
                 an agent brief join the AFK-ready pool and get head-SHA
                 progress detection. Defaults to ``False`` so the default
                 GitHub-issues behaviour is byte-for-byte unchanged.
         """
         self._diag = diag
+        self._gh = gh
         self._include_prs = include_prs
 
     def preflight(self) -> int | None:
@@ -277,7 +289,7 @@ class GitHubIssueSource:
         GitHub mode requires ``gh`` to be available, authenticated, and repo-scoped.
         """
         try:
-            authed = gh_module.auth_status()
+            authed = self._gh.auth_status()
         except gh_module.GhError as exc:
             self._diag.error(
                 "gh preflight failed: %s. Install `gh` from "
@@ -292,7 +304,7 @@ class GitHubIssueSource:
             )
             return 1
         try:
-            repo = gh_module.repo_view()
+            repo = self._gh.repo_view()
         except gh_module.GhError as exc:
             self._diag.error(
                 "gh repo view failed: %s. Ralph-afk must be run from inside a "
@@ -312,7 +324,7 @@ class GitHubIssueSource:
         satisfy the AFK shape.
         """
         try:
-            candidates = gh_module.issue_list("ready-for-agent")
+            candidates = self._gh.issue_list("ready-for-agent")
         except gh_module.GhError as exc:
             self._diag.error("gh issue list failed: %s", exc)
             return []
@@ -322,7 +334,7 @@ class GitHubIssueSource:
         items: list[AfkReadyItem] = []
         for issue in ready_candidates:
             try:
-                full = gh_module.issue_view(issue.number)
+                full = self._gh.issue_view(issue.number)
             except gh_module.GhError as exc:
                 self._diag.warning(
                     "gh issue view #%s failed: %s; skipping for this iteration",
@@ -354,7 +366,7 @@ class GitHubIssueSource:
         ``ready-for-agent`` PR set is normally tiny, so the N+1 is cheap.
         """
         try:
-            candidates = gh_module.pr_list("ready-for-agent")
+            candidates = self._gh.pr_list("ready-for-agent")
         except gh_module.GhError as exc:
             self._diag.error("gh pr list failed: %s", exc)
             return []
@@ -362,7 +374,7 @@ class GitHubIssueSource:
         items: list[AfkReadyItem] = []
         for pr in candidates:
             try:
-                full = gh_module.pr_view(pr.number)
+                full = self._gh.pr_view(pr.number)
             except gh_module.GhError as exc:
                 self._diag.warning(
                     "gh pr view #%s failed: %s; skipping for this iteration",
@@ -404,8 +416,8 @@ class GitHubIssueSource:
         * **Issue closures:** for each new base-branch commit, extract
           closing-keyword refs (``Closes #N`` / ``Fixes #N`` / ``Resolves
           #N``), filter to the iteration's *issue* pool whitelist, re-verify
-          state via :func:`gh.issue_view`, then close via
-          :func:`gh.issue_close`. Per-issue try/except — one failure doesn't
+          state via the injected client's ``issue_view``, then close via its
+          ``issue_close``. Per-issue try/except — one failure doesn't
           lose the rest of the iteration's bookkeeping.
         """
         completions: list[Completion] = []
@@ -426,7 +438,7 @@ class GitHubIssueSource:
                 # No baseline SHA captured at collection time; can't compare.
                 continue
             try:
-                current = gh_module.pr_view(item.ref)
+                current = self._gh.pr_view(item.ref)
             except gh_module.GhError as exc:
                 self._diag.warning(
                     "gh pr view #%s during PR-advance check failed: %s",
@@ -504,7 +516,7 @@ class GitHubIssueSource:
             return None
 
         try:
-            current = gh_module.issue_view(issue_number)
+            current = self._gh.issue_view(issue_number)
         except gh_module.GhError as exc:
             self._diag.warning(
                 "gh issue view #%s during auto-close failed: %s",
@@ -533,7 +545,7 @@ class GitHubIssueSource:
             f"new commit that references it."
         )
         try:
-            gh_module.issue_close(issue_number, comment)
+            self._gh.issue_close(issue_number, comment)
         except gh_module.GhError as exc:
             self._diag.warning(
                 "gh issue close #%s failed: %s; issue remains open",

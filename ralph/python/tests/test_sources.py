@@ -21,6 +21,7 @@ from ralph_afk.sources import (
     is_afk_ready,
     is_pr_afk_ready,
 )
+from tests.fakes import FakeGitHubClient
 
 
 # --------------------------------------------------------------------------- #
@@ -160,7 +161,7 @@ class TestDataclassShapes:
 
 class TestProtocolConformance:
     def test_github_source_satisfies_protocol_isinstance(self) -> None:
-        impl = GitHubIssueSource(_silent_logger())
+        impl = GitHubIssueSource(_silent_logger(), gh=FakeGitHubClient())
         assert isinstance(impl, IssueSource)
 
     def test_prds_source_satisfies_protocol_isinstance(self, tmp_path: Path) -> None:
@@ -180,43 +181,30 @@ class TestProtocolConformance:
 
 
 class TestGitHubPreflight:
-    def test_returns_none_when_gh_ok(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(gh_module, "auth_status", lambda: True)
-        monkeypatch.setattr(
-            gh_module,
-            "repo_view",
-            lambda: gh_module.Repo(owner="x", name="y", default_branch="main"),
+    def test_returns_none_when_gh_ok(self) -> None:
+        gh = FakeGitHubClient(
+            authed=True, repo=gh_module.Repo(owner="x", name="y", default_branch="main")
         )
-        impl = GitHubIssueSource(_silent_logger())
+        impl = GitHubIssueSource(_silent_logger(), gh=gh)
         assert impl.preflight() is None
 
-    def test_returns_one_when_gh_not_authed(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(gh_module, "auth_status", lambda: False)
-        impl = GitHubIssueSource(_silent_logger())
+    def test_returns_one_when_gh_not_authed(self) -> None:
+        impl = GitHubIssueSource(_silent_logger(), gh=FakeGitHubClient(authed=False))
         assert impl.preflight() == 1
 
-    def test_returns_one_when_auth_status_raises(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        def _raise() -> bool:
-            raise gh_module.GhError(["gh", "auth", "status"], 127, "missing")
-
-        monkeypatch.setattr(gh_module, "auth_status", _raise)
-        impl = GitHubIssueSource(_silent_logger())
+    def test_returns_one_when_auth_status_raises(self) -> None:
+        gh = FakeGitHubClient(
+            auth_status_error=gh_module.GhError(["gh", "auth", "status"], 127, "missing")
+        )
+        impl = GitHubIssueSource(_silent_logger(), gh=gh)
         assert impl.preflight() == 1
 
-    def test_returns_one_when_repo_view_raises(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(gh_module, "auth_status", lambda: True)
-
-        def _raise() -> gh_module.Repo:
-            raise gh_module.GhError(["gh", "repo", "view"], 1, "not a repo")
-
-        monkeypatch.setattr(gh_module, "repo_view", _raise)
-        impl = GitHubIssueSource(_silent_logger())
+    def test_returns_one_when_repo_view_raises(self) -> None:
+        gh = FakeGitHubClient(
+            authed=True,
+            repo_view_error=gh_module.GhError(["gh", "repo", "view"], 1, "not a repo"),
+        )
+        impl = GitHubIssueSource(_silent_logger(), gh=gh)
         assert impl.preflight() == 1
 
 
@@ -226,57 +214,36 @@ class TestGitHubPreflight:
 
 
 class TestGitHubCollectAfkReady:
-    def test_returns_empty_when_list_raises(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        def _raise(*_a: Any, **_kw: Any) -> list[gh_module.Issue]:
-            raise gh_module.GhError(["gh", "issue", "list"], 1, "boom")
-
-        monkeypatch.setattr(gh_module, "issue_list", _raise)
-        impl = GitHubIssueSource(_silent_logger())
+    def test_returns_empty_when_list_raises(self) -> None:
+        gh = FakeGitHubClient(
+            issue_list_error=gh_module.GhError(["gh", "issue", "list"], 1, "boom")
+        )
+        impl = GitHubIssueSource(_silent_logger(), gh=gh)
         assert impl.collect_afk_ready() == []
 
-    def test_filters_out_issues_lacking_discriminator(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_filters_out_issues_lacking_discriminator(self) -> None:
         good = _make_issue(42)
         bad = _make_issue(43, body="just words, no sections")
-        view_calls: list[int] = []
+        gh = FakeGitHubClient(issues=[good, bad])
 
-        def fake_view(num: int) -> gh_module.Issue:
-            view_calls.append(num)
-            return good if num == 42 else bad
-
-        monkeypatch.setattr(
-            gh_module, "issue_list", lambda label, state="open": [good, bad]
-        )
-        monkeypatch.setattr(gh_module, "issue_view", fake_view)
-
-        impl = GitHubIssueSource(_silent_logger())
+        impl = GitHubIssueSource(_silent_logger(), gh=gh)
         items = impl.collect_afk_ready()
 
         assert [i.ref for i in items] == [42]
         # Discriminator filter runs BEFORE the per-issue view to save
         # the N+1 round-trip on non-AFK-ready candidates.
-        assert view_calls == [42], (
-            f"expected only #42 to be view-fetched; got {view_calls}"
+        assert gh.issue_view_calls == [42], (
+            f"expected only #42 to be view-fetched; got {gh.issue_view_calls}"
         )
 
-    def test_renders_block_with_header_body_and_no_comments(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_renders_block_with_header_body_and_no_comments(self) -> None:
         issue = _make_issue(
             42,
             title="Do the thing",
             labels=["ready-for-agent", "bug"],
             body="## Parent\n#1\n\n## What to build\nthing\n\n## Acceptance criteria\n- ok",
         )
-        monkeypatch.setattr(
-            gh_module, "issue_list", lambda label, state="open": [issue]
-        )
-        monkeypatch.setattr(gh_module, "issue_view", lambda n: issue)
-
-        impl = GitHubIssueSource(_silent_logger())
+        impl = GitHubIssueSource(_silent_logger(), gh=FakeGitHubClient(issues=[issue]))
         items = impl.collect_afk_ready()
         assert len(items) == 1
         block = items[0].rendered_block
@@ -286,9 +253,7 @@ class TestGitHubCollectAfkReady:
         assert "## What to build" in block
         assert "## Acceptance criteria" in block
 
-    def test_renders_block_with_recent_comments_newest_first(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_renders_block_with_recent_comments_newest_first(self) -> None:
         comments = (
             gh_module.Comment(
                 author="alice", body="old comment", created_at="2026-05-10T00:00:00Z"
@@ -298,12 +263,7 @@ class TestGitHubCollectAfkReady:
             ),
         )
         issue = _make_issue(42, comments=comments)
-        monkeypatch.setattr(
-            gh_module, "issue_list", lambda label, state="open": [issue]
-        )
-        monkeypatch.setattr(gh_module, "issue_view", lambda n: issue)
-
-        impl = GitHubIssueSource(_silent_logger())
+        impl = GitHubIssueSource(_silent_logger(), gh=FakeGitHubClient(issues=[issue]))
         items = impl.collect_afk_ready()
         block = items[0].rendered_block
 
@@ -319,39 +279,30 @@ class TestGitHubCollectAfkReady:
             "newest comment (bob) should appear before older (alice)"
         )
 
-    def test_skips_issue_view_failure_continues_others(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_skips_issue_view_failure_continues_others(self) -> None:
         ok = _make_issue(42)
         broken = _make_issue(99)
-
-        def fake_view(num: int) -> gh_module.Issue:
-            if num == 99:
-                raise gh_module.GhError(["gh"], 1, "broken")
-            return ok
-
-        monkeypatch.setattr(
-            gh_module, "issue_list", lambda label, state="open": [ok, broken]
+        # The list yields both, but the per-issue view fails for #99 only — the
+        # source must skip it and keep #42.
+        gh = FakeGitHubClient(
+            issues=[ok, broken],
+            issue_view_errors={99: gh_module.GhError(["gh"], 1, "broken")},
         )
-        monkeypatch.setattr(gh_module, "issue_view", fake_view)
 
-        impl = GitHubIssueSource(_silent_logger())
+        impl = GitHubIssueSource(_silent_logger(), gh=gh)
         items = impl.collect_afk_ready()
         assert [i.ref for i in items] == [42]
 
-    def test_re_verifies_discriminator_on_full_body(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_re_verifies_discriminator_on_full_body(self) -> None:
         """If issue_view returns a different body lacking the discriminator, drop it."""
-        stub_list_body = _make_issue(42)
-        stub_full = _make_issue(42, body="No discriminator anymore")
-
-        monkeypatch.setattr(
-            gh_module, "issue_list", lambda label, state="open": [stub_list_body]
+        # The list body carries the discriminator; the full single view does not,
+        # so the source must drop it at the re-verify step (not at the list step).
+        gh = FakeGitHubClient(
+            issues=[_make_issue(42)],
+            issue_views={42: _make_issue(42, body="No discriminator anymore")},
         )
-        monkeypatch.setattr(gh_module, "issue_view", lambda n: stub_full)
 
-        impl = GitHubIssueSource(_silent_logger())
+        impl = GitHubIssueSource(_silent_logger(), gh=gh)
         assert impl.collect_afk_ready() == []
 
 
@@ -362,7 +313,7 @@ class TestGitHubCollectAfkReady:
 
 class TestGitHubHandleCompletions:
     def test_returns_empty_when_no_new_commits(self) -> None:
-        impl = GitHubIssueSource(_silent_logger())
+        impl = GitHubIssueSource(_silent_logger(), gh=FakeGitHubClient())
         completions = impl.handle_completions(
             pool=[AfkReadyItem(ref=42, title="t", rendered_block="x")],
             new_commits=[],
@@ -370,25 +321,16 @@ class TestGitHubHandleCompletions:
         assert completions == []
 
     def test_returns_empty_when_pool_is_empty(self) -> None:
-        impl = GitHubIssueSource(_silent_logger())
+        impl = GitHubIssueSource(_silent_logger(), gh=FakeGitHubClient())
         completions = impl.handle_completions(
             pool=[],
             new_commits=[_FakeCommit("sha1", "Closes #42")],
         )
         assert completions == []
 
-    def test_closes_issue_when_commit_references_pool_member(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        close_calls: list[tuple[int, str]] = []
-
-        def fake_close(num: int, body: str) -> None:
-            close_calls.append((num, body))
-
-        monkeypatch.setattr(gh_module, "issue_view", lambda n: _make_issue(n))
-        monkeypatch.setattr(gh_module, "issue_close", fake_close)
-
-        impl = GitHubIssueSource(_silent_logger())
+    def test_closes_issue_when_commit_references_pool_member(self) -> None:
+        gh = FakeGitHubClient(issues=[_make_issue(42)])
+        impl = GitHubIssueSource(_silent_logger(), gh=gh)
         completions = impl.handle_completions(
             pool=[AfkReadyItem(ref=42, title="t", rendered_block="x")],
             new_commits=[
@@ -400,65 +342,36 @@ class TestGitHubHandleCompletions:
         assert completions[0].ref == 42
         assert completions[0].sha == "sha_abc"
         assert completions[0].shas == ("sha_abc",)
-        assert len(close_calls) == 1
-        assert close_calls[0][0] == 42
+        assert len(gh.issue_close_calls) == 1
+        assert gh.issue_close_calls[0][0] == 42
 
-    def test_skips_close_when_ref_not_in_pool(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        close_calls: list[tuple[int, str]] = []
-
-        def fake_close(num: int, body: str) -> None:
-            close_calls.append((num, body))
-
-        monkeypatch.setattr(gh_module, "issue_view", lambda n: _make_issue(n))
-        monkeypatch.setattr(gh_module, "issue_close", fake_close)
-
-        impl = GitHubIssueSource(_silent_logger())
+    def test_skips_close_when_ref_not_in_pool(self) -> None:
+        gh = FakeGitHubClient(issues=[_make_issue(42)])
+        impl = GitHubIssueSource(_silent_logger(), gh=gh)
         completions = impl.handle_completions(
             pool=[AfkReadyItem(ref=42, title="t", rendered_block="x")],
             new_commits=[_FakeCommit("sha", "Closes #99")],
         )
         assert completions == []
-        assert close_calls == []
+        assert gh.issue_close_calls == []
 
-    def test_skips_close_when_issue_already_closed(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(
-            gh_module,
-            "issue_view",
-            lambda n: _make_issue(n, state="CLOSED"),
-        )
-        close_calls: list[Any] = []
-        monkeypatch.setattr(
-            gh_module,
-            "issue_close",
-            lambda *a, **kw: close_calls.append((a, kw)),
-        )
-
-        impl = GitHubIssueSource(_silent_logger())
+    def test_skips_close_when_issue_already_closed(self) -> None:
+        gh = FakeGitHubClient(issues=[_make_issue(42, state="CLOSED")])
+        impl = GitHubIssueSource(_silent_logger(), gh=gh)
         completions = impl.handle_completions(
             pool=[AfkReadyItem(ref=42, title="t", rendered_block="x")],
             new_commits=[_FakeCommit("sha", "Closes #42")],
         )
         assert completions == []
-        assert close_calls == []
+        assert gh.issue_close_calls == []
 
-    def test_close_failure_is_non_fatal_to_other_completions(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        close_calls: list[int] = []
-
-        def fake_close(num: int, body: str) -> None:
-            close_calls.append(num)
-            if num == 42:
-                raise gh_module.GhError(["gh"], 1, "boom")
-
-        monkeypatch.setattr(gh_module, "issue_view", lambda n: _make_issue(n))
-        monkeypatch.setattr(gh_module, "issue_close", fake_close)
-
-        impl = GitHubIssueSource(_silent_logger())
+    def test_close_failure_is_non_fatal_to_other_completions(self) -> None:
+        # The close of #42 fails; #43 must still be closed and completed.
+        gh = FakeGitHubClient(
+            issues=[_make_issue(42), _make_issue(43)],
+            issue_close_errors={42: gh_module.GhError(["gh"], 1, "boom")},
+        )
+        impl = GitHubIssueSource(_silent_logger(), gh=gh)
         completions = impl.handle_completions(
             pool=[
                 AfkReadyItem(ref=42, title="t", rendered_block="x"),
@@ -471,20 +384,13 @@ class TestGitHubHandleCompletions:
         )
         # #42 close raised → no completion; #43 still proceeds.
         assert [c.ref for c in completions] == [43]
-        assert close_calls == [42, 43]
+        assert [num for num, _ in gh.issue_close_calls] == [42, 43]
 
     def test_attributes_multiple_shas_when_multiple_commits_reference_issue(
-        self, monkeypatch: pytest.MonkeyPatch
+        self,
     ) -> None:
-        close_calls: list[str] = []
-
-        def fake_close(num: int, body: str) -> None:
-            close_calls.append(body)
-
-        monkeypatch.setattr(gh_module, "issue_view", lambda n: _make_issue(n))
-        monkeypatch.setattr(gh_module, "issue_close", fake_close)
-
-        impl = GitHubIssueSource(_silent_logger())
+        gh = FakeGitHubClient(issues=[_make_issue(42)])
+        impl = GitHubIssueSource(_silent_logger(), gh=gh)
         completions = impl.handle_completions(
             pool=[AfkReadyItem(ref=42, title="t", rendered_block="x")],
             new_commits=[
@@ -916,38 +822,23 @@ class TestPrDataclassShapes:
 
 
 class TestGitHubCollectAfkReadyPrs:
-    def test_does_not_list_prs_when_include_prs_false(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        called = {"pr_list": 0}
-        monkeypatch.setattr(gh_module, "issue_list", lambda label, state="open": [])
-
-        def _pr_list(*_a: Any, **_kw: Any) -> list[gh_module.PullRequest]:
-            called["pr_list"] += 1
-            return []
-
-        monkeypatch.setattr(gh_module, "pr_list", _pr_list)
-        impl = GitHubIssueSource(_silent_logger())  # include_prs defaults False
+    def test_does_not_list_prs_when_include_prs_false(self) -> None:
+        # include_prs defaults False, so pr_list must never be called.
+        gh = FakeGitHubClient(issues=[], prs=[_make_pr(7)])
+        impl = GitHubIssueSource(_silent_logger(), gh=gh)
         assert impl.collect_afk_ready() == []
-        assert called["pr_list"] == 0
+        assert gh.pr_list_calls == []
 
-    def test_collects_only_prs_with_brief_when_enabled(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(gh_module, "issue_list", lambda label, state="open": [])
-        monkeypatch.setattr(
-            gh_module,
-            "pr_list",
-            lambda label, state="open": [_make_pr(7), _make_pr(8)],
+    def test_collects_only_prs_with_brief_when_enabled(self) -> None:
+        # #7 carries an agent brief (in a comment); #8 does not — filtered out.
+        gh = FakeGitHubClient(
+            issues=[],
+            prs=[
+                _make_pr(7, comments=(_brief_comment(),), head_sha="oldsha"),
+                _make_pr(8, body="no brief here"),
+            ],
         )
-
-        def fake_pr_view(n: int) -> gh_module.PullRequest:
-            if n == 7:
-                return _make_pr(7, comments=(_brief_comment(),), head_sha="oldsha")
-            return _make_pr(8, body="no brief here")  # filtered out
-
-        monkeypatch.setattr(gh_module, "pr_view", fake_pr_view)
-        impl = GitHubIssueSource(_silent_logger(), include_prs=True)
+        impl = GitHubIssueSource(_silent_logger(), gh=gh, include_prs=True)
         items = impl.collect_afk_ready()
 
         assert [i.ref for i in items] == [7]
@@ -956,16 +847,11 @@ class TestGitHubCollectAfkReadyPrs:
         assert items[0].rendered_block.startswith("=== PR #7:")
         assert "(branch: feature/x)" in items[0].rendered_block
 
-    def test_pr_list_failure_is_non_fatal(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(gh_module, "issue_list", lambda label, state="open": [])
-
-        def _raise(*_a: Any, **_kw: Any) -> list[gh_module.PullRequest]:
-            raise gh_module.GhError(["gh", "pr", "list"], 1, "boom")
-
-        monkeypatch.setattr(gh_module, "pr_list", _raise)
-        impl = GitHubIssueSource(_silent_logger(), include_prs=True)
+    def test_pr_list_failure_is_non_fatal(self) -> None:
+        gh = FakeGitHubClient(
+            issues=[], pr_list_error=gh_module.GhError(["gh", "pr", "list"], 1, "boom")
+        )
+        impl = GitHubIssueSource(_silent_logger(), gh=gh, include_prs=True)
         assert impl.collect_afk_ready() == []
 
 
@@ -981,101 +867,63 @@ def _pool_pr(number: int = 7, head_sha: str = "oldsha") -> AfkReadyItem:
 
 
 class TestGitHubDetectPrAdvances:
-    def test_records_advance_when_head_sha_changed(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(
-            gh_module, "pr_view", lambda n: _make_pr(n, head_sha="newsha")
-        )
-        impl = GitHubIssueSource(_silent_logger(), include_prs=True)
+    def test_records_advance_when_head_sha_changed(self) -> None:
+        gh = FakeGitHubClient(prs=[_make_pr(7, head_sha="newsha")])
+        impl = GitHubIssueSource(_silent_logger(), gh=gh, include_prs=True)
         completions = impl.handle_completions(pool=[_pool_pr()], new_commits=[])
         assert len(completions) == 1
         assert completions[0].ref == 7
         assert completions[0].kind == "pr"
         assert completions[0].sha == "newsha"
 
-    def test_no_advance_when_head_sha_unchanged(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(
-            gh_module, "pr_view", lambda n: _make_pr(n, head_sha="oldsha")
-        )
-        impl = GitHubIssueSource(_silent_logger(), include_prs=True)
+    def test_no_advance_when_head_sha_unchanged(self) -> None:
+        gh = FakeGitHubClient(prs=[_make_pr(7, head_sha="oldsha")])
+        impl = GitHubIssueSource(_silent_logger(), gh=gh, include_prs=True)
         assert (
             impl.handle_completions(pool=[_pool_pr(head_sha="oldsha")], new_commits=[])
             == []
         )
 
-    def test_no_advance_when_pr_merged(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(
-            gh_module,
-            "pr_view",
-            lambda n: _make_pr(n, head_sha="newsha", state="MERGED"),
+    def test_no_advance_when_pr_merged(self) -> None:
+        gh = FakeGitHubClient(prs=[_make_pr(7, head_sha="newsha", state="MERGED")])
+        impl = GitHubIssueSource(_silent_logger(), gh=gh, include_prs=True)
+        assert impl.handle_completions(pool=[_pool_pr()], new_commits=[]) == []
+
+    def test_detection_skipped_when_include_prs_false(self) -> None:
+        # include_prs False → the PR-advance check never runs, so pr_view is untouched.
+        gh = FakeGitHubClient(prs=[_make_pr(7, head_sha="newsha")])
+        impl = GitHubIssueSource(_silent_logger(), gh=gh)
+        assert impl.handle_completions(pool=[_pool_pr()], new_commits=[]) == []
+        assert gh.pr_view_calls == []
+
+    def test_pr_view_failure_during_detect_is_non_fatal(self) -> None:
+        gh = FakeGitHubClient(
+            pr_view_errors={7: gh_module.GhError(["gh", "pr", "view", "7"], 1, "boom")}
         )
-        impl = GitHubIssueSource(_silent_logger(), include_prs=True)
-        assert impl.handle_completions(pool=[_pool_pr()], new_commits=[]) == []
-
-    def test_detection_skipped_when_include_prs_false(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        called = {"pr_view": 0}
-
-        def _pr_view(n: int) -> gh_module.PullRequest:
-            called["pr_view"] += 1
-            return _make_pr(n, head_sha="newsha")
-
-        monkeypatch.setattr(gh_module, "pr_view", _pr_view)
-        impl = GitHubIssueSource(_silent_logger())  # include_prs False
-        assert impl.handle_completions(pool=[_pool_pr()], new_commits=[]) == []
-        assert called["pr_view"] == 0
-
-    def test_pr_view_failure_during_detect_is_non_fatal(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        def _raise(n: int) -> gh_module.PullRequest:
-            raise gh_module.GhError(["gh", "pr", "view", str(n)], 1, "boom")
-
-        monkeypatch.setattr(gh_module, "pr_view", _raise)
-        impl = GitHubIssueSource(_silent_logger(), include_prs=True)
+        impl = GitHubIssueSource(_silent_logger(), gh=gh, include_prs=True)
         assert impl.handle_completions(pool=[_pool_pr()], new_commits=[]) == []
 
 
 class TestGitHubMixedPoolBackstop:
-    def test_closes_keyword_never_closes_pr_sharing_number(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_closes_keyword_never_closes_pr_sharing_number(self) -> None:
         """A ``Closes #7`` must not ``gh issue close`` #7 when #7 is a PR."""
-        close_calls: list[int] = []
-        monkeypatch.setattr(gh_module, "issue_view", lambda n: _make_issue(n))
-        monkeypatch.setattr(
-            gh_module, "issue_close", lambda n, c: close_calls.append(n)
-        )
         # PR-advance check: head unchanged → no PR completion either.
-        monkeypatch.setattr(
-            gh_module, "pr_view", lambda n: _make_pr(n, head_sha="oldsha")
+        gh = FakeGitHubClient(
+            issues=[_make_issue(7)], prs=[_make_pr(7, head_sha="oldsha")]
         )
-        impl = GitHubIssueSource(_silent_logger(), include_prs=True)
+        impl = GitHubIssueSource(_silent_logger(), gh=gh, include_prs=True)
         completions = impl.handle_completions(
             pool=[_pool_pr(number=7, head_sha="oldsha")],
             new_commits=[_FakeCommit("sha", "Closes #7")],
         )
-        assert close_calls == []
+        assert gh.issue_close_calls == []
         assert completions == []
 
-    def test_issue_closure_still_works_with_pr_in_pool(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        close_calls: list[int] = []
-        monkeypatch.setattr(gh_module, "issue_view", lambda n: _make_issue(n))
-        monkeypatch.setattr(
-            gh_module, "issue_close", lambda n, c: close_calls.append(n)
+    def test_issue_closure_still_works_with_pr_in_pool(self) -> None:
+        gh = FakeGitHubClient(
+            issues=[_make_issue(42)], prs=[_make_pr(7, head_sha="oldsha")]
         )
-        monkeypatch.setattr(
-            gh_module, "pr_view", lambda n: _make_pr(n, head_sha="oldsha")
-        )
-        impl = GitHubIssueSource(_silent_logger(), include_prs=True)
+        impl = GitHubIssueSource(_silent_logger(), gh=gh, include_prs=True)
         completions = impl.handle_completions(
             pool=[
                 _pool_pr(number=7, head_sha="oldsha"),
@@ -1083,5 +931,5 @@ class TestGitHubMixedPoolBackstop:
             ],
             new_commits=[_FakeCommit("sha", "Closes #42")],
         )
-        assert close_calls == [42]
+        assert [num for num, _ in gh.issue_close_calls] == [42]
         assert [c.ref for c in completions] == [42]

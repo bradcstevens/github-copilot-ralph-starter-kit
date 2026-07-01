@@ -116,6 +116,7 @@ from copilot import CopilotClient
 from rich.console import Console
 
 from ralph_afk import events as events_module
+from ralph_afk import gh as gh_module
 from ralph_afk import git as git_module
 from ralph_afk.config import RunConfig
 from ralph_afk.emit import EventEmitter
@@ -211,6 +212,24 @@ def _make_git_client() -> git_module.SubprocessGitClient:
     return git_module.SubprocessGitClient.discover()
 
 
+def _make_github_client() -> gh_module.SubprocessGitHubClient:
+    """Construct the per-invocation GitHub client.
+
+    Factored to its own module-level function — mirroring :func:`_make_git_client`
+    — so tests can monkeypatch it
+    (``monkeypatch.setattr("ralph_afk.loop._make_github_client", ...)``) to inject
+    a single fake object (``tests.fakes.FakeGitHubClient``) instead of
+    monkeypatching a handful of ``gh.*`` free functions. Production callers get a
+    :class:`~ralph_afk.gh.SubprocessGitHubClient`.
+
+    Unlike :func:`_make_git_client` there is **no cwd binding** — ``gh`` runs in
+    the process cwd — so the client is stateless and takes no construction
+    arguments. Only the ``github`` :class:`IssueSource` backend needs it; the
+    ``prds`` backend has no GitHub dependency.
+    """
+    return gh_module.SubprocessGitHubClient()
+
+
 def _make_issue_source(
     config: RunConfig,
     repo_root: Path,
@@ -241,7 +260,9 @@ def _make_issue_source(
             branch here.
     """
     if config.issue_source == "github":
-        return GitHubIssueSource(diag, include_prs=include_prs)
+        return GitHubIssueSource(
+            diag, gh=_make_github_client(), include_prs=include_prs
+        )
     if config.issue_source == "prds":
         return PrdsIssueSource(repo_root, diag)
     raise ValueError(

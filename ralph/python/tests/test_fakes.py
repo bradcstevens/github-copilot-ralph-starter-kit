@@ -1,9 +1,10 @@
-"""Tests for the reusable test fakes in ``tests/fakes.py`` (issue #46).
+"""Tests for the reusable test fakes in ``tests/fakes.py`` (issues #46, #47).
 
 The loop and source suites lean on these fakes to substitute a whole seam with
-one object; these tests pin the fake's *own* contract so a drifting fake cannot
+one object; these tests pin each fake's *own* contract so a drifting fake cannot
 quietly invalidate the suites that build on it — chiefly the
-**checkpoint-exclusion** invariant that keeps the Strike rule honest.
+**checkpoint-exclusion** invariant that keeps the Strike rule honest (git), and
+the **close-flips-to-CLOSED** modelling the auto-close backstop leans on (gh).
 """
 
 from __future__ import annotations
@@ -12,8 +13,9 @@ from pathlib import Path
 
 import pytest
 
+from ralph_afk.gh import GhError, GitHubClient, Issue, PullRequest, Repo
 from ralph_afk.git import Commit, GitClient, GitError
-from tests.fakes import FakeGitClient
+from tests.fakes import FakeGitClient, FakeGitHubClient
 
 
 def test_fake_git_client_satisfies_gitclient_protocol(tmp_path: Path) -> None:
@@ -123,3 +125,155 @@ def test_commits_between_unknown_sha_raises(tmp_path: Path) -> None:
     git = FakeGitClient(tmp_path)
     with pytest.raises(GitError):
         git.commits_between("deadbeef", git.head_sha())
+
+
+# ---------------------------------------------------------------------------
+# FakeGitHubClient (the gh seam, #47)
+# ---------------------------------------------------------------------------
+
+
+def _issue(number: int, *, state: str = "OPEN") -> Issue:
+    return Issue(
+        number=number,
+        title=f"issue {number}",
+        body="body",
+        labels=["ready-for-agent"],
+        state=state,
+        url=f"https://example/issues/{number}",
+        comments=(),
+    )
+
+
+def _pr(number: int, *, state: str = "OPEN", head_sha: str = "sha0") -> PullRequest:
+    return PullRequest(
+        number=number,
+        title=f"pr {number}",
+        body="body",
+        labels=["ready-for-agent"],
+        state=state,
+        url=f"https://example/pull/{number}",
+        head_sha=head_sha,
+        head_branch=f"feature/{number}",
+        comments=(),
+    )
+
+
+def test_fake_github_client_satisfies_githubclient_protocol() -> None:
+    """The fake satisfies the ``@runtime_checkable`` ``GitHubClient`` structurally."""
+    assert isinstance(FakeGitHubClient(), GitHubClient)
+    assert not isinstance(object(), GitHubClient)
+
+
+def test_auth_and_repo_defaults_and_overrides() -> None:
+    default = FakeGitHubClient()
+    assert default.auth_status() is True
+    assert isinstance(default.repo_view(), Repo)
+    signed_out = FakeGitHubClient(authed=False, repo=Repo(owner="o", name="n", default_branch="dev"))
+    assert signed_out.auth_status() is False
+    assert signed_out.repo_view().nwo == "o/n"
+
+
+def test_issue_list_and_view_derive_from_one_store() -> None:
+    gh = FakeGitHubClient(issues=[_issue(42), _issue(43, state="CLOSED")])
+    # issue_list filters by state (open by default); the numbers stay consistent
+    # with what issue_view returns.
+    assert [i.number for i in gh.issue_list("ready-for-agent")] == [42]
+    assert {i.number for i in gh.issue_list("ready-for-agent", "all")} == {42, 43}
+    assert [i.number for i in gh.issue_list("ready-for-agent", "closed")] == [43]
+    assert gh.issue_view(42).state == "OPEN"
+    assert gh.issue_list_calls == [
+        ("ready-for-agent", "open"),
+        ("ready-for-agent", "all"),
+        ("ready-for-agent", "closed"),
+    ]
+    assert gh.issue_view_calls == [42]
+
+
+def test_issue_close_records_and_flips_state_to_closed() -> None:
+    """The auto-close backstop leans on this: a recorded action that lands the close."""
+    gh = FakeGitHubClient(issues=[_issue(42)])
+    gh.issue_close(42, "done via Closes #42")
+    # Recorded as a pure mechanic...
+    assert gh.issue_close_calls == [(42, "done via Closes #42")]
+    # ...and the close lands, exactly as real ``gh`` would (a later view sees it).
+    assert gh.issue_view(42).state == "CLOSED"
+    assert gh.issue_list("ready-for-agent") == []
+
+
+def test_pr_list_view_and_head_advance() -> None:
+    gh = FakeGitHubClient(prs=[_pr(7, head_sha="old"), _pr(8, state="MERGED")])
+    assert [p.number for p in gh.pr_list("ready-for-agent")] == [7]
+    assert gh.pr_view(7).head_sha == "old"
+    # set_pr_head models an agent push between two pr_view reads.
+    gh.set_pr_head(7, "new")
+    assert gh.pr_view(7).head_sha == "new"
+    assert gh.pr_view_calls == [7, 7]
+
+
+@pytest.mark.parametrize(
+    "kwargs, call",
+    [
+        ({"auth_status_error": GhError(["gh"], 1, "boom")}, lambda gh: gh.auth_status()),
+        ({"repo_view_error": GhError(["gh"], 1, "boom")}, lambda gh: gh.repo_view()),
+        ({"issue_list_error": GhError(["gh"], 1, "boom")}, lambda gh: gh.issue_list("l")),
+        ({"issue_view_errors": {42: GhError(["gh"], 1, "boom")}}, lambda gh: gh.issue_view(42)),
+        ({"issue_close_errors": {42: GhError(["gh"], 1, "boom")}}, lambda gh: gh.issue_close(42, "c")),
+        ({"pr_list_error": GhError(["gh"], 1, "boom")}, lambda gh: gh.pr_list("l")),
+        ({"pr_view_errors": {7: GhError(["gh"], 1, "boom")}}, lambda gh: gh.pr_view(7)),
+    ],
+)
+def test_injected_gh_errors_are_raised(kwargs: dict, call) -> None:
+    gh = FakeGitHubClient(issues=[_issue(42)], prs=[_pr(7)], **kwargs)
+    with pytest.raises(GhError):
+        call(gh)
+
+
+def test_per_number_errors_leave_the_rest_of_the_pool_working() -> None:
+    """A per-number view/close failure isolates to that number; others proceed."""
+    gh = FakeGitHubClient(
+        issues=[_issue(42), _issue(43)],
+        issue_view_errors={43: GhError(["gh"], 1, "boom")},
+    )
+    assert gh.issue_view(42).number == 42  # sibling unaffected
+    with pytest.raises(GhError):
+        gh.issue_view(43)
+
+
+def test_issue_views_override_diverges_view_from_list() -> None:
+    """``issue_views`` returns a *different* body than the list (re-verify path)."""
+    listed = _issue(42)  # carries a body
+    full = Issue(
+        number=42,
+        title="issue 42",
+        body="no discriminator anymore",
+        labels=["ready-for-agent"],
+        state="OPEN",
+        url="u",
+        comments=(),
+    )
+    gh = FakeGitHubClient(issues=[listed], issue_views={42: full})
+    assert gh.issue_list("ready-for-agent")[0].body == "body"
+    assert gh.issue_view(42).body == "no discriminator anymore"
+
+
+def test_issue_close_error_still_records_the_attempt() -> None:
+    """The source treats a close failure as non-fatal, so the spy must witness it."""
+    gh = FakeGitHubClient(
+        issues=[_issue(42)], issue_close_errors={42: GhError(["gh"], 1, "boom")}
+    )
+    with pytest.raises(GhError):
+        gh.issue_close(42, "c")
+    assert gh.issue_close_calls == [(42, "c")]
+    # The state did not flip (the close never landed).
+    assert gh.issue_view(42).state == "OPEN"
+
+
+def test_unknown_number_views_raise_gherror() -> None:
+    gh = FakeGitHubClient()
+    with pytest.raises(GhError):
+        gh.issue_view(999)
+    with pytest.raises(GhError):
+        gh.pr_view(999)
+    # issue_close on an unknown number is a silent no-op (recorded, nothing to flip).
+    gh.issue_close(999, "c")
+    assert gh.issue_close_calls == [(999, "c")]

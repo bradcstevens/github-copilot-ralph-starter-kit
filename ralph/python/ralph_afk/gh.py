@@ -7,33 +7,58 @@ SSO tokens, and device-flow refresh) remains the single source of truth.
 
 Issue I/O uses ``gh`` + the stdlib :mod:`json` (no ``jq`` dependency).
 
+GitHub is a **real seam** (mirroring :class:`ralph_afk.git.GitClient`, #46):
+:class:`ralph_afk.sources.GitHubIssueSource` holds a :class:`GitHubClient` (an
+injectable Protocol) rather than calling module functions, so the sources tests
+substitute one object (``tests.fakes.FakeGitHubClient``) instead of
+monkeypatching a handful of free functions. Unlike the git seam there is **no
+cwd binding** — ``gh`` runs in the process cwd — so the Protocol methods keep
+their natural signatures and the adapter is stateless (``SubprocessGitHubClient()``
+takes no arguments).
+
 Public surface:
 
-* :exc:`GhError` — typed failure from any public function.
-* :class:`Repo`, :class:`Issue`, :class:`Comment` — frozen value objects.
-* :func:`auth_status` — preflight check; returns ``bool`` (does not raise on
-  "not signed in"; only raises :exc:`GhError` if the ``gh`` binary itself
-  is missing).
-* :func:`repo_view` — current repository's ``owner`` / ``name`` / default branch.
-* :func:`issue_list` — list issues filtered by label and state. One pass
-  pulls every field the loop's prompt needs; ``comments`` is left empty.
-* :func:`issue_view` — full single-issue view including ``comments``.
-* :func:`issue_close` — close an issue with a wrap-up comment **and verify**
-  the close landed (raises :exc:`GhError` if the post-close state is not
-  ``CLOSED``).
-* :class:`PullRequest` — frozen value object for a pull request, carrying
-  ``head_sha`` (``headRefOid``) and ``head_branch`` (``headRefName``) so the
-  loop can detect a PR-branch advance by SHA without a local checkout.
-* :func:`pr_list` — list PRs filtered by label and state (``comments`` left
-  empty, mirroring :func:`issue_list`).
-* :func:`pr_view` — full single-PR view including ``comments``. The wrapper
-  **never** closes or merges a PR (humans merge in QA), so there is no
-  ``pr_close`` counterpart to :func:`issue_close`.
+* :exc:`GhError` — typed failure from any client method.
+* :class:`Repo`, :class:`Issue`, :class:`Comment`, :class:`PullRequest` — frozen
+  value objects the Protocol references. :class:`PullRequest` carries
+  ``head_sha`` (``headRefOid``) and ``head_branch`` (``headRefName``) so the loop
+  can detect a PR-branch advance by SHA without a local checkout.
+* :class:`GitHubClient` — ``@runtime_checkable`` Protocol naming the GitHub
+  **mechanics** the source needs (list / view / close). The **policy** — what
+  counts as a closure for **Strike**/progress, any close-keyword semantics —
+  stays in the source/loop, never in the client; :meth:`~GitHubClient.issue_close`
+  is a pure recorded action that never infers progress.
+* :class:`SubprocessGitHubClient` — the production adapter. Stateless; every
+  method shells out to real ``gh`` in the process cwd.
+
+The client's mechanics:
+
+* :meth:`~SubprocessGitHubClient.auth_status` — preflight check; returns ``bool``
+  (does not raise on "not signed in"; only raises :exc:`GhError` if the ``gh``
+  binary itself is missing).
+* :meth:`~SubprocessGitHubClient.repo_view` — current repository's ``owner`` /
+  ``name`` / default branch.
+* :meth:`~SubprocessGitHubClient.issue_list` — list issues filtered by label and
+  state. One pass pulls every field the loop's prompt needs; ``comments`` is
+  left empty.
+* :meth:`~SubprocessGitHubClient.issue_view` — full single-issue view including
+  ``comments``.
+* :meth:`~SubprocessGitHubClient.issue_close` — close an issue with a wrap-up
+  comment **and verify** the close landed (raises :exc:`GhError` if the
+  post-close state is not ``CLOSED``).
+* :meth:`~SubprocessGitHubClient.pr_list` — list PRs filtered by label and state
+  (``comments`` left empty, mirroring :meth:`~SubprocessGitHubClient.issue_list`).
+* :meth:`~SubprocessGitHubClient.pr_view` — full single-PR view including
+  ``comments``. The wrapper **never** closes or merges a PR (humans merge in QA),
+  so there is no ``pr_close`` counterpart to
+  :meth:`~SubprocessGitHubClient.issue_close`.
 
 Design notes:
 
 * **No Python-native API libraries.** ``httpx`` / ``requests`` / ``PyGithub``
   are explicitly forbidden — enforced by ``tests/test_no_forbidden_api_libs.py``.
+  The seam keeps that posture: the adapter still shells out to real ``gh`` and
+  the user's ``gh auth`` stays the single source of truth.
 * **One small ``_run`` helper.** Centralises the subprocess invocation, error
   conversion, and stderr-tail extraction so every public function gets the
   same error semantics for free.
@@ -48,7 +73,7 @@ from __future__ import annotations
 import json
 import subprocess
 from dataclasses import dataclass, field
-from typing import Final, Sequence
+from typing import Final, Protocol, Sequence, runtime_checkable
 
 __all__ = [
     "GhError",
@@ -56,13 +81,8 @@ __all__ = [
     "Comment",
     "Issue",
     "PullRequest",
-    "auth_status",
-    "repo_view",
-    "issue_list",
-    "issue_view",
-    "issue_close",
-    "pr_list",
-    "pr_view",
+    "GitHubClient",
+    "SubprocessGitHubClient",
 ]
 
 _GH_BIN: Final[str] = "gh"
@@ -348,156 +368,288 @@ def _parse_pr(data: object, cmd: Sequence[str]) -> PullRequest:
 
 
 # --------------------------------------------------------------------------- #
-# Public API                                                                  #
+# GitHubClient seam                                                           #
 # --------------------------------------------------------------------------- #
 
 
-def auth_status() -> bool:
-    """Return ``True`` if ``gh`` is signed in, ``False`` otherwise.
+@runtime_checkable
+class GitHubClient(Protocol):
+    """The GitHub **mechanics** the source needs, as an injectable seam.
 
-    Asymmetric with the rest of the module: a "not signed in" state
-    (``gh auth status`` rc=1)
-    is a normal outcome the loop wants to recover from with a user-facing
-    message, not an exception. Only a missing ``gh`` binary raises
-    :exc:`GhError`.
+    Stateless: unlike :class:`ralph_afk.git.GitClient` there is **no cwd
+    binding** — ``gh`` runs in the process cwd — so the methods keep their
+    natural signatures. :class:`ralph_afk.sources.GitHubIssueSource` holds one
+    ``GitHubClient`` and owns the **policy** (what counts as a closure for
+    **Strike**/progress, any close-keyword semantics); the client only provides
+    raw list / view / close mechanics and never infers progress.
+    :meth:`issue_close` in particular is a pure recorded action — it must not
+    filter by Strike rules or interpret close-keywords.
+
+    :class:`SubprocessGitHubClient` is the production adapter;
+    ``tests.fakes.FakeGitHubClient`` the in-memory test double. Both satisfy this
+    Protocol structurally — no subclassing required, but ``isinstance(impl,
+    GitHubClient)`` works because the decorator marks it ``@runtime_checkable``.
     """
-    cmd = [_GH_BIN, "auth", "status"]
-    try:
-        completed = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise GhError(cmd, 127, "gh not found on PATH") from exc
-    return completed.returncode == 0
+
+    def auth_status(self) -> bool:
+        """Return ``True`` if ``gh`` is signed in, ``False`` otherwise."""
+        ...
+
+    def repo_view(self) -> Repo:
+        """Return the current repository's identifying ``owner``/``name`` triple."""
+        ...
+
+    def issue_list(self, label: str, state: str = "open") -> list[Issue]:
+        """List issues filtered by ``label`` / ``state`` (``comments`` left empty)."""
+        ...
+
+    def issue_view(self, number: int) -> Issue:
+        """Fetch one issue including its ``comments``."""
+        ...
+
+    def issue_close(self, number: int, comment: str) -> None:
+        """Close an issue with a wrap-up comment and verify the close landed."""
+        ...
+
+    def pr_list(self, label: str, state: str = "open") -> list[PullRequest]:
+        """List pull requests filtered by ``label`` / ``state`` (``comments`` empty)."""
+        ...
+
+    def pr_view(self, number: int) -> PullRequest:
+        """Fetch one pull request including its ``comments`` and head-ref fields."""
+        ...
 
 
-def repo_view() -> Repo:
-    """Return identity of the repository the current cwd resolves to.
+class SubprocessGitHubClient:
+    """Stateless :class:`GitHubClient` shelling out to the real ``gh`` CLI.
 
-    Raises:
-        GhError: If ``gh repo view`` fails (e.g. cwd is not a GitHub remote)
-            or returns a payload the parser cannot understand.
+    Holds no state — ``gh`` runs in the process cwd, so unlike
+    :class:`ralph_afk.git.SubprocessGitClient` there is nothing to bind at
+    construction (``SubprocessGitHubClient()`` takes no arguments). Every method
+    funnels through the module-level :func:`_run` so the error semantics are
+    uniform, and the user's ``gh auth`` stays the single source of truth (no
+    ``httpx`` / ``requests`` / ``PyGithub``).
     """
-    cmd = ["repo", "view", "--json", "owner,name,defaultBranchRef"]
-    raw = _run(cmd)
-    data = _parse_json(raw, [_GH_BIN, *cmd])
-    if not isinstance(data, dict):
-        raise GhError(
-            [_GH_BIN, *cmd],
-            0,
-            f"expected JSON object for repo view, got {type(data).__name__}",
-        )
-    try:
-        return Repo(
-            owner=str(data["owner"]["login"]),
-            name=str(data["name"]),
-            default_branch=str(data["defaultBranchRef"]["name"]),
-        )
-    except (KeyError, TypeError) as exc:
-        raise GhError(
-            [_GH_BIN, *cmd],
-            0,
-            f"gh repo view JSON missing or malformed field: {exc}",
-        ) from exc
+
+    def auth_status(self) -> bool:
+        """Return ``True`` if ``gh`` is signed in, ``False`` otherwise.
+
+        Asymmetric with the rest of the client: a "not signed in" state
+        (``gh auth status`` rc=1)
+        is a normal outcome the loop wants to recover from with a user-facing
+        message, not an exception. Only a missing ``gh`` binary raises
+        :exc:`GhError`.
+        """
+        cmd = [_GH_BIN, "auth", "status"]
+        try:
+            completed = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise GhError(cmd, 127, "gh not found on PATH") from exc
+        return completed.returncode == 0
+
+    def repo_view(self) -> Repo:
+        """Return identity of the repository the current cwd resolves to.
+
+        Raises:
+            GhError: If ``gh repo view`` fails (e.g. cwd is not a GitHub remote)
+                or returns a payload the parser cannot understand.
+        """
+        cmd = ["repo", "view", "--json", "owner,name,defaultBranchRef"]
+        raw = _run(cmd)
+        data = _parse_json(raw, [_GH_BIN, *cmd])
+        if not isinstance(data, dict):
+            raise GhError(
+                [_GH_BIN, *cmd],
+                0,
+                f"expected JSON object for repo view, got {type(data).__name__}",
+            )
+        try:
+            return Repo(
+                owner=str(data["owner"]["login"]),
+                name=str(data["name"]),
+                default_branch=str(data["defaultBranchRef"]["name"]),
+            )
+        except (KeyError, TypeError) as exc:
+            raise GhError(
+                [_GH_BIN, *cmd],
+                0,
+                f"gh repo view JSON missing or malformed field: {exc}",
+            ) from exc
+
+    def issue_list(self, label: str, state: str = "open") -> list[Issue]:
+        """List issues filtered by label and state.
+
+        Args:
+            label: A single label name (matches ``gh``'s single ``--label`` flag).
+            state: ``"open"``, ``"closed"``, or ``"all"`` — passed verbatim to
+                ``gh issue list --state``. Defaults to ``"open"`` for the
+                AFK-ready issue collector.
+
+        Returns:
+            A list of :class:`Issue` with ``comments`` always empty. The loop
+            decides whether to fetch comments per-issue via :meth:`issue_view`.
+
+        Raises:
+            GhError: On any subprocess or parse failure.
+        """
+        cmd = [
+            "issue",
+            "list",
+            "--state",
+            state,
+            "--label",
+            label,
+            "--limit",
+            "100",
+            "--json",
+            "number,title,body,labels,state,url",
+        ]
+        raw = _run(cmd)
+        parsed = _parse_json(raw, [_GH_BIN, *cmd])
+        if not isinstance(parsed, list):
+            raise GhError(
+                [_GH_BIN, *cmd],
+                0,
+                f"expected JSON array from gh issue list, got {type(parsed).__name__}",
+            )
+        return [_parse_issue(item, [_GH_BIN, *cmd]) for item in parsed]
+
+    def issue_view(self, number: int) -> Issue:
+        """Fetch one issue including its comments.
+
+        Args:
+            number: Issue number.
+
+        Returns:
+            The :class:`Issue` with ``comments`` populated.
+
+        Raises:
+            GhError: On any subprocess or parse failure (e.g. issue not found).
+        """
+        cmd = [
+            "issue",
+            "view",
+            str(number),
+            "--json",
+            "number,title,body,labels,state,url,comments",
+        ]
+        raw = _run(cmd)
+        parsed = _parse_json(raw, [_GH_BIN, *cmd])
+        return _parse_issue(parsed, [_GH_BIN, *cmd])
+
+    def issue_close(self, number: int, comment: str) -> None:
+        """Close an issue with a wrap-up comment, then verify the close landed.
+
+        A ``gh issue close`` success is not trusted alone — we re-read state via
+        ``gh issue view ... --json state`` and raise :exc:`GhError` if the
+        post-close state is not
+        ``CLOSED``. Closing an already-closed issue is a no-op (``gh`` is
+        idempotent on this; the verify step still requires ``CLOSED``).
+
+        This is a pure recorded **mechanic**: it closes exactly what it is told
+        to close. Deciding *whether* a closure counts as **Strike** progress, or
+        interpreting close-keywords, is the source/loop's **policy** — never the
+        client's.
+
+        Args:
+            number: Issue number to close.
+            comment: Markdown body for the wrap-up comment. Passed via argv
+                (no shell), so no escaping is required for the caller.
+
+        Raises:
+            GhError: If the close subprocess fails, the verify subprocess fails,
+                or the post-close state is not ``CLOSED``.
+        """
+        close_cmd = ["issue", "close", str(number), "--comment", comment]
+        _run(close_cmd)
+        verify_state = _issue_state(number)
+        if verify_state != "CLOSED":
+            verify_cmd = [_GH_BIN, "issue", "view", str(number), "--json", "state"]
+            raise GhError(
+                verify_cmd,
+                0,
+                f"gh issue close #{number} returned success but state is "
+                f"{verify_state!r}, not 'CLOSED'.",
+            )
+
+    def pr_list(self, label: str, state: str = "open") -> list[PullRequest]:
+        """List pull requests filtered by label and state.
+
+        The PR-surface analogue of :meth:`issue_list`. Used by the AFK loop only
+        when PR support is enabled (see
+        :class:`ralph_afk.sources.GitHubIssueSource`).
+
+        Args:
+            label: A single label name (matches ``gh``'s single ``--label`` flag).
+            state: ``"open"`` (default), ``"closed"``, ``"merged"``, or ``"all"`` —
+                passed verbatim to ``gh pr list --state``.
+
+        Returns:
+            A list of :class:`PullRequest` with ``comments`` always empty
+            (mirroring :meth:`issue_list`); the loop enriches per-PR via
+            :meth:`pr_view` only for candidates it actually feeds the agent.
+
+        Raises:
+            GhError: On any subprocess or parse failure.
+        """
+        cmd = [
+            "pr",
+            "list",
+            "--state",
+            state,
+            "--label",
+            label,
+            "--limit",
+            "100",
+            "--json",
+            "number,title,body,labels,state,url,headRefOid,headRefName",
+        ]
+        raw = _run(cmd)
+        parsed = _parse_json(raw, [_GH_BIN, *cmd])
+        if not isinstance(parsed, list):
+            raise GhError(
+                [_GH_BIN, *cmd],
+                0,
+                f"expected JSON array from gh pr list, got {type(parsed).__name__}",
+            )
+        return [_parse_pr(item, [_GH_BIN, *cmd]) for item in parsed]
+
+    def pr_view(self, number: int) -> PullRequest:
+        """Fetch one pull request including its comments and head-ref fields.
+
+        Args:
+            number: PR number.
+
+        Returns:
+            The :class:`PullRequest` with ``comments`` populated and a fresh
+            ``head_sha`` — the loop re-reads this after an iteration to decide
+            whether the PR branch advanced.
+
+        Raises:
+            GhError: On any subprocess or parse failure (e.g. PR not found).
+        """
+        cmd = [
+            "pr",
+            "view",
+            str(number),
+            "--json",
+            "number,title,body,labels,state,url,headRefOid,headRefName,comments",
+        ]
+        raw = _run(cmd)
+        parsed = _parse_json(raw, [_GH_BIN, *cmd])
+        return _parse_pr(parsed, [_GH_BIN, *cmd])
 
 
-def issue_list(label: str, state: str = "open") -> list[Issue]:
-    """List issues filtered by label and state.
-
-    Args:
-        label: A single label name (matches ``gh``'s single ``--label`` flag).
-        state: ``"open"``, ``"closed"``, or ``"all"`` — passed verbatim to
-            ``gh issue list --state``. Defaults to ``"open"`` for the
-            AFK-ready issue collector.
-
-    Returns:
-        A list of :class:`Issue` with ``comments`` always empty. The loop
-        decides whether to fetch comments per-issue via :func:`issue_view`.
-
-    Raises:
-        GhError: On any subprocess or parse failure.
-    """
-    cmd = [
-        "issue",
-        "list",
-        "--state",
-        state,
-        "--label",
-        label,
-        "--limit",
-        "100",
-        "--json",
-        "number,title,body,labels,state,url",
-    ]
-    raw = _run(cmd)
-    parsed = _parse_json(raw, [_GH_BIN, *cmd])
-    if not isinstance(parsed, list):
-        raise GhError(
-            [_GH_BIN, *cmd],
-            0,
-            f"expected JSON array from gh issue list, got {type(parsed).__name__}",
-        )
-    return [_parse_issue(item, [_GH_BIN, *cmd]) for item in parsed]
-
-
-def issue_view(number: int) -> Issue:
-    """Fetch one issue including its comments.
-
-    Args:
-        number: Issue number.
-
-    Returns:
-        The :class:`Issue` with ``comments`` populated.
-
-    Raises:
-        GhError: On any subprocess or parse failure (e.g. issue not found).
-    """
-    cmd = [
-        "issue",
-        "view",
-        str(number),
-        "--json",
-        "number,title,body,labels,state,url,comments",
-    ]
-    raw = _run(cmd)
-    parsed = _parse_json(raw, [_GH_BIN, *cmd])
-    return _parse_issue(parsed, [_GH_BIN, *cmd])
-
-
-def issue_close(number: int, comment: str) -> None:
-    """Close an issue with a wrap-up comment, then verify the close landed.
-
-    A ``gh issue close`` success is not trusted alone — we re-read state via
-    ``gh issue view ... --json state`` and raise :exc:`GhError` if the
-    post-close state is not
-    ``CLOSED``. Closing an already-closed issue is a no-op (``gh`` is
-    idempotent on this; the verify step still requires ``CLOSED``).
-
-    Args:
-        number: Issue number to close.
-        comment: Markdown body for the wrap-up comment. Passed via argv
-            (no shell), so no escaping is required for the caller.
-
-    Raises:
-        GhError: If the close subprocess fails, the verify subprocess fails,
-            or the post-close state is not ``CLOSED``.
-    """
-    close_cmd = ["issue", "close", str(number), "--comment", comment]
-    _run(close_cmd)
-    verify_state = _issue_state(number)
-    if verify_state != "CLOSED":
-        verify_cmd = [_GH_BIN, "issue", "view", str(number), "--json", "state"]
-        raise GhError(
-            verify_cmd,
-            0,
-            f"gh issue close #{number} returned success but state is "
-            f"{verify_state!r}, not 'CLOSED'.",
-        )
+# --------------------------------------------------------------------------- #
+# Internal: single-field state read for the issue_close verify step           #
+# --------------------------------------------------------------------------- #
 
 
 def _issue_state(number: int) -> str:
@@ -512,71 +664,3 @@ def _issue_state(number: int) -> str:
             f"gh issue view #{number} state JSON malformed: {parsed!r}",
         )
     return str(parsed["state"])
-
-
-def pr_list(label: str, state: str = "open") -> list[PullRequest]:
-    """List pull requests filtered by label and state.
-
-    The PR-surface analogue of :func:`issue_list`. Used by the AFK loop only
-    when PR support is enabled (see :class:`ralph_afk.sources.GitHubIssueSource`).
-
-    Args:
-        label: A single label name (matches ``gh``'s single ``--label`` flag).
-        state: ``"open"`` (default), ``"closed"``, ``"merged"``, or ``"all"`` —
-            passed verbatim to ``gh pr list --state``.
-
-    Returns:
-        A list of :class:`PullRequest` with ``comments`` always empty
-        (mirroring :func:`issue_list`); the loop enriches per-PR via
-        :func:`pr_view` only for candidates it actually feeds the agent.
-
-    Raises:
-        GhError: On any subprocess or parse failure.
-    """
-    cmd = [
-        "pr",
-        "list",
-        "--state",
-        state,
-        "--label",
-        label,
-        "--limit",
-        "100",
-        "--json",
-        "number,title,body,labels,state,url,headRefOid,headRefName",
-    ]
-    raw = _run(cmd)
-    parsed = _parse_json(raw, [_GH_BIN, *cmd])
-    if not isinstance(parsed, list):
-        raise GhError(
-            [_GH_BIN, *cmd],
-            0,
-            f"expected JSON array from gh pr list, got {type(parsed).__name__}",
-        )
-    return [_parse_pr(item, [_GH_BIN, *cmd]) for item in parsed]
-
-
-def pr_view(number: int) -> PullRequest:
-    """Fetch one pull request including its comments and head-ref fields.
-
-    Args:
-        number: PR number.
-
-    Returns:
-        The :class:`PullRequest` with ``comments`` populated and a fresh
-        ``head_sha`` — the loop re-reads this after an iteration to decide
-        whether the PR branch advanced.
-
-    Raises:
-        GhError: On any subprocess or parse failure (e.g. PR not found).
-    """
-    cmd = [
-        "pr",
-        "view",
-        str(number),
-        "--json",
-        "number,title,body,labels,state,url,headRefOid,headRefName,comments",
-    ]
-    raw = _run(cmd)
-    parsed = _parse_json(raw, [_GH_BIN, *cmd])
-    return _parse_pr(parsed, [_GH_BIN, *cmd])

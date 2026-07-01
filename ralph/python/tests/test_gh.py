@@ -17,19 +17,28 @@ import pytest
 
 from ralph_afk import gh
 from ralph_afk.gh import (
-    Comment,
     GhError,
+    GitHubClient,
     Issue,
     PullRequest,
     Repo,
-    auth_status,
-    issue_close,
-    issue_list,
-    issue_view,
-    pr_list,
-    pr_view,
-    repo_view,
+    SubprocessGitHubClient,
 )
+
+# The ``gh`` mechanics moved from module free functions onto the stateless
+# :class:`SubprocessGitHubClient` adapter (#47, mirroring the git seam #46). Bind
+# its methods once so every call site below simply *retargets* onto the adapter —
+# the ``subprocess.run`` mock (installed per test via ``_install_fake_run``) and
+# every parse / error assertion are unchanged. The adapter is stateless, so one
+# shared instance is equivalent to constructing a fresh one per call.
+_client = SubprocessGitHubClient()
+auth_status = _client.auth_status
+repo_view = _client.repo_view
+issue_list = _client.issue_list
+issue_view = _client.issue_view
+issue_close = _client.issue_close
+pr_list = _client.pr_list
+pr_view = _client.pr_view
 
 
 # --------------------------------------------------------------------------- #
@@ -54,6 +63,17 @@ def _install_fake_run(monkeypatch, handler):
     captured argvs available via the closure pattern callers use.
     """
     monkeypatch.setattr(gh.subprocess, "run", handler)
+
+
+# --------------------------------------------------------------------------- #
+# Protocol conformance                                                         #
+# --------------------------------------------------------------------------- #
+
+
+def test_subprocess_github_client_satisfies_githubclient_protocol() -> None:
+    """The adapter satisfies the ``@runtime_checkable`` ``GitHubClient`` structurally."""
+    assert isinstance(SubprocessGitHubClient(), GitHubClient)
+    assert not isinstance(object(), GitHubClient)
 
 
 # --------------------------------------------------------------------------- #

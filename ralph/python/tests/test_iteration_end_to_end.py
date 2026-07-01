@@ -11,8 +11,12 @@ API; it monkeypatches:
 * ``ralph_afk.loop._make_client`` → a :class:`FakeCopilotClient`
   (reused from :mod:`tests.test_session`) that scripts a single
   iteration's SDK event flow.
-* ``ralph_afk.gh.auth_status`` / ``repo_view`` / ``issue_list`` /
-  ``issue_view`` / ``issue_close`` → stubs.
+* ``ralph_afk.loop._make_github_client`` → a single
+  :class:`~tests.fakes.FakeGitHubClient` (issue #47) injected through the
+  loop's ``gh`` seam, replacing the old per-function ``ralph_afk.gh.*``
+  monkeypatches. Its issue store keeps ``issue_list`` / ``issue_view``
+  consistent, and its ``issue_close`` records the call AND flips the issue to
+  ``CLOSED`` by construction (modelling the auto-close backstop's re-verify).
 * ``ralph_afk.loop._make_git_client`` → a single
   :class:`~tests.fakes.FakeGitClient` (issue #46) injected through the loop's
   git seam, replacing the old per-function ``ralph_afk.git.*`` monkeypatches.
@@ -29,7 +33,7 @@ After ``loop.run`` returns, the test asserts:
 * ``.ralph/runs/<stem>.json`` exists and matches the persist schema
   (one iteration row, expected counts).
 * ``.gitignore`` contains ``.ralph/`` (the persist factory touches it).
-* The ``gh.issue_close`` stub was called exactly once with the right
+* The fake client's ``issue_close`` was called exactly once with the right
   arguments (auto-close backstop fired).
 """
 
@@ -63,7 +67,7 @@ from ralph_afk.pricing import Pricing
 from ralph_afk.sinks import SinkFanout
 from ralph_afk.ui import RunSummary
 from ralph_afk.wrapper import is_checkpoint_message
-from tests.fakes import FakeGitClient
+from tests.fakes import FakeGitClient, FakeGitHubClient
 
 
 # ---------------------------------------------------------------------------
@@ -249,55 +253,21 @@ def test_loop_runs_one_iteration_end_to_end(tmp_path, monkeypatch) -> None:
     )
     monkeypatch.setattr(loop_module, "_make_git_client", lambda: fake_git)
 
-    # -- 3) gh stubs -------------------------------------------------------
+    # -- 3) gh seam: FakeGitHubClient seeded with the AFK-ready pool ------
+    # #42 is AFK-ready (carries the discriminator); #43 lacks it and is
+    # filtered at the list stage before any ``issue_view``. The fake's
+    # ``issue_close`` records the call AND flips #42 OPEN -> CLOSED by
+    # construction, modelling the transition the auto-close re-verify relies
+    # on (no ``issue_42_state`` bookkeeping needed).
     issue_42 = _make_issue(42)
     issue_43_no_discrim = _make_issue(
         43, body="no parent here, no AC here, just words"
     )
-
-    monkeypatch.setattr(gh_module, "auth_status", lambda: True)
-    monkeypatch.setattr(
-        gh_module,
-        "repo_view",
-        lambda: gh_module.Repo(owner="x", name="y", default_branch="main"),
+    fake_gh = FakeGitHubClient(
+        repo=gh_module.Repo(owner="x", name="y", default_branch="main"),
+        issues=[issue_42, issue_43_no_discrim],
     )
-    monkeypatch.setattr(
-        gh_module,
-        "issue_list",
-        lambda label, state="open": [issue_42, issue_43_no_discrim],
-    )
-
-    issue_view_calls: list[int] = []
-    close_calls: list[tuple[int, str]] = []
-
-    # State sequence for #42: still OPEN at auto-close time, then CLOSED
-    # after issue_close returns. issue_view is called during pool
-    # enrichment AND during the auto-close re-verify.
-    issue_42_state = {"value": "OPEN"}
-
-    def fake_issue_view(number: int) -> gh_module.Issue:
-        issue_view_calls.append(number)
-        if number == 42:
-            return gh_module.Issue(
-                number=42,
-                title=issue_42.title,
-                body=issue_42.body,
-                labels=issue_42.labels,
-                state=issue_42_state["value"],
-                url=issue_42.url,
-                comments=(),
-            )
-        if number == 43:
-            return issue_43_no_discrim
-        raise gh_module.GhError(["gh", "issue", "view", str(number)], 1, "not found")
-
-    def fake_issue_close(number: int, comment: str) -> None:
-        close_calls.append((number, comment))
-        if number == 42:
-            issue_42_state["value"] = "CLOSED"
-
-    monkeypatch.setattr(gh_module, "issue_view", fake_issue_view)
-    monkeypatch.setattr(gh_module, "issue_close", fake_issue_close)
+    monkeypatch.setattr(loop_module, "_make_github_client", lambda: fake_gh)
 
     # -- 4) SDK stub: one tool call + one assistant message + usage -------
     scripted = [
@@ -366,13 +336,13 @@ def test_loop_runs_one_iteration_end_to_end(tmp_path, monkeypatch) -> None:
     assert timeout > 60.0, f"send_and_wait timeout must exceed SDK default; got {timeout}"
 
     # Auto-close fired for #42, not for any other issue.
-    assert close_calls == [(42, close_calls[0][1])] if close_calls else False, (
-        f"expected exactly one close call for #42; got {close_calls}"
+    assert len(fake_gh.issue_close_calls) == 1, (
+        f"expected exactly one close call for #42; got {fake_gh.issue_close_calls}"
     )
-    assert close_calls[0][0] == 42
-    assert "abcdef1234" in close_calls[0][1], (
+    assert fake_gh.issue_close_calls[0][0] == 42
+    assert "abcdef1234" in fake_gh.issue_close_calls[0][1], (
         f"close comment should reference the closing commit SHA; "
-        f"got {close_calls[0][1]!r}"
+        f"got {fake_gh.issue_close_calls[0][1]!r}"
     )
 
     # .gitignore touched.
@@ -438,13 +408,10 @@ def test_loop_empty_pool_exits_zero(tmp_path, monkeypatch) -> None:
     fake_git = FakeGitClient(tmp_path)
     monkeypatch.setattr(loop_module, "_make_git_client", lambda: fake_git)
 
-    monkeypatch.setattr(gh_module, "auth_status", lambda: True)
-    monkeypatch.setattr(
-        gh_module,
-        "repo_view",
-        lambda: gh_module.Repo(owner="x", name="y", default_branch="main"),
+    fake_gh = FakeGitHubClient(
+        repo=gh_module.Repo(owner="x", name="y", default_branch="main"), issues=[]
     )
-    monkeypatch.setattr(gh_module, "issue_list", lambda label, state="open": [])
+    monkeypatch.setattr(loop_module, "_make_github_client", lambda: fake_gh)
 
     fake_client = FakeCopilotClient(scripted_events=[])
     monkeypatch.setattr(loop_module, "_make_client", lambda: fake_client)
@@ -473,15 +440,15 @@ def _wire_single_issue_github(
 ) -> tuple[FakeCopilotClient, FakeGitClient]:
     """Minimal github wiring for a one-issue run with no agent commits.
 
-    Sets up the repo on disk, the gh stubs (one AFK-ready issue that is never
-    closed), and injects a single :class:`~tests.fakes.FakeGitClient` through the
-    loop's git seam. By default the worktree is clean and the agent makes no
-    commit, so ``head_sha`` is constant across the iteration
-    (``commits_between`` is empty); pass ``dirty=True`` / ``untracked=True`` /
-    ``commit_error`` / ``push_error`` to script the Checkpoint / push path a test
-    wants. Returns ``(fake_client, fake_git)`` so the caller can drive the
-    SDK ``on_send`` hook and inspect the ``add_all`` / ``commit`` / ``push``
-    spies.
+    Sets up the repo on disk, injects a :class:`~tests.fakes.FakeGitHubClient`
+    (one AFK-ready issue that is never closed) through the loop's ``gh`` seam,
+    and injects a single :class:`~tests.fakes.FakeGitClient` through the loop's
+    git seam. By default the worktree is clean and the agent makes no commit, so
+    ``head_sha`` is constant across the iteration (``commits_between`` is empty);
+    pass ``dirty=True`` / ``untracked=True`` / ``commit_error`` / ``push_error``
+    to script the Checkpoint / push path a test wants. Returns
+    ``(fake_client, fake_git)`` so the caller can drive the SDK ``on_send`` hook
+    and inspect the ``add_all`` / ``commit`` / ``push`` spies.
     """
     (tmp_path / "ralph").mkdir()
     (tmp_path / "ralph" / "prompt.md").write_text("be ralph", encoding="utf-8")
@@ -496,17 +463,11 @@ def _wire_single_issue_github(
     )
     monkeypatch.setattr(loop_module, "_make_git_client", lambda: fake_git)
 
-    monkeypatch.setattr(gh_module, "auth_status", lambda: True)
-    monkeypatch.setattr(
-        gh_module,
-        "repo_view",
-        lambda: gh_module.Repo(owner="x", name="y", default_branch="main"),
+    fake_gh = FakeGitHubClient(
+        repo=gh_module.Repo(owner="x", name="y", default_branch="main"),
+        issues=[issue],
     )
-    monkeypatch.setattr(
-        gh_module, "issue_list", lambda label, state="open": [issue]
-    )
-    monkeypatch.setattr(gh_module, "issue_view", lambda number: issue)
-    monkeypatch.setattr(gh_module, "issue_close", lambda number, comment: None)
+    monkeypatch.setattr(loop_module, "_make_github_client", lambda: fake_gh)
 
     fake_client = FakeCopilotClient(scripted_events=[])
     monkeypatch.setattr(loop_module, "_make_client", lambda: fake_client)
@@ -806,37 +767,18 @@ def test_loop_prds_end_to_end_one_iteration(tmp_path, monkeypatch) -> None:
     )
     monkeypatch.setattr(loop_module, "_make_git_client", lambda: fake_git)
 
-    # -- 3) gh MUST NOT be called in PRDs mode ----------------------------
-    # If anything in the loop reaches for gh.* in PRDs mode, the test
-    # should fail loudly. We replace each accessed symbol with a
-    # function that records the call.
+    # -- 3) gh MUST NOT be reached in PRDs mode ---------------------------
+    # The loop only touches GitHub through the client from
+    # ``_make_github_client``; PRDs mode uses PrdsIssueSource and must never
+    # construct one. Record any attempt to build the client so a regression
+    # that reaches for gh in PRDs mode fails loudly.
     gh_calls: list[str] = []
 
-    def boom_auth_status() -> bool:
-        gh_calls.append("auth_status")
-        raise AssertionError("gh.auth_status must not be called in PRDs mode")
+    def _forbidden_github_client() -> gh_module.GitHubClient:
+        gh_calls.append("_make_github_client")
+        raise AssertionError("gh must not be constructed in PRDs mode")
 
-    def boom_repo_view() -> gh_module.Repo:
-        gh_calls.append("repo_view")
-        raise AssertionError("gh.repo_view must not be called in PRDs mode")
-
-    def boom_issue_list(*_a: Any, **_kw: Any) -> list[gh_module.Issue]:
-        gh_calls.append("issue_list")
-        raise AssertionError("gh.issue_list must not be called in PRDs mode")
-
-    def boom_issue_view(*_a: Any, **_kw: Any) -> gh_module.Issue:
-        gh_calls.append("issue_view")
-        raise AssertionError("gh.issue_view must not be called in PRDs mode")
-
-    def boom_issue_close(*_a: Any, **_kw: Any) -> None:
-        gh_calls.append("issue_close")
-        raise AssertionError("gh.issue_close must not be called in PRDs mode")
-
-    monkeypatch.setattr(gh_module, "auth_status", boom_auth_status)
-    monkeypatch.setattr(gh_module, "repo_view", boom_repo_view)
-    monkeypatch.setattr(gh_module, "issue_list", boom_issue_list)
-    monkeypatch.setattr(gh_module, "issue_view", boom_issue_view)
-    monkeypatch.setattr(gh_module, "issue_close", boom_issue_close)
+    monkeypatch.setattr(loop_module, "_make_github_client", _forbidden_github_client)
 
     # -- 4) SDK stub: minimal scripted flow --------------------------------
     scripted = [
@@ -958,13 +900,11 @@ def test_loop_prds_empty_pool_exits_zero(tmp_path, monkeypatch) -> None:
     fake_git = FakeGitClient(tmp_path)
     monkeypatch.setattr(loop_module, "_make_git_client", lambda: fake_git)
 
-    # PRDs mode must not touch gh.
-    def boom(*_a: Any, **_kw: Any) -> Any:
-        raise AssertionError("gh must not be called in PRDs mode")
+    # PRDs mode must not construct a GitHubClient.
+    def _forbidden_github_client() -> Any:
+        raise AssertionError("gh must not be constructed in PRDs mode")
 
-    monkeypatch.setattr(gh_module, "auth_status", boom)
-    monkeypatch.setattr(gh_module, "repo_view", boom)
-    monkeypatch.setattr(gh_module, "issue_list", boom)
+    monkeypatch.setattr(loop_module, "_make_github_client", _forbidden_github_client)
 
     fake_client = FakeCopilotClient(scripted_events=[])
     monkeypatch.setattr(loop_module, "_make_client", lambda: fake_client)
@@ -985,7 +925,9 @@ def test_loop_preflight_failure_when_gh_not_authed(tmp_path, monkeypatch) -> Non
 
     fake_git = FakeGitClient(tmp_path)
     monkeypatch.setattr(loop_module, "_make_git_client", lambda: fake_git)
-    monkeypatch.setattr(gh_module, "auth_status", lambda: False)
+    monkeypatch.setattr(
+        loop_module, "_make_github_client", lambda: FakeGitHubClient(authed=False)
+    )
 
     fake_client = FakeCopilotClient(scripted_events=[])
     monkeypatch.setattr(loop_module, "_make_client", lambda: fake_client)
@@ -1010,22 +952,11 @@ def test_loop_aborts_after_max_nmt_strikes(tmp_path, monkeypatch) -> None:
     fake_git = FakeGitClient(tmp_path)
     monkeypatch.setattr(loop_module, "_make_git_client", lambda: fake_git)
 
-    monkeypatch.setattr(gh_module, "auth_status", lambda: True)
-    monkeypatch.setattr(
-        gh_module,
-        "repo_view",
-        lambda: gh_module.Repo(owner="x", name="y", default_branch="main"),
+    fake_gh = FakeGitHubClient(
+        repo=gh_module.Repo(owner="x", name="y", default_branch="main"),
+        issues=[_make_issue(42)],
     )
-    monkeypatch.setattr(
-        gh_module,
-        "issue_list",
-        lambda label, state="open": [_make_issue(42)],
-    )
-    monkeypatch.setattr(
-        gh_module,
-        "issue_view",
-        lambda n: _make_issue(n),
-    )
+    monkeypatch.setattr(loop_module, "_make_github_client", lambda: fake_gh)
 
     fake_client = FakeCopilotClient(scripted_events=[])
     monkeypatch.setattr(loop_module, "_make_client", lambda: fake_client)
@@ -1060,16 +991,11 @@ def test_loop_send_and_wait_exception_is_no_progress(tmp_path, monkeypatch) -> N
     fake_git = FakeGitClient(tmp_path)
     monkeypatch.setattr(loop_module, "_make_git_client", lambda: fake_git)
 
-    monkeypatch.setattr(gh_module, "auth_status", lambda: True)
-    monkeypatch.setattr(
-        gh_module,
-        "repo_view",
-        lambda: gh_module.Repo(owner="x", name="y", default_branch="main"),
+    fake_gh = FakeGitHubClient(
+        repo=gh_module.Repo(owner="x", name="y", default_branch="main"),
+        issues=[_make_issue(42)],
     )
-    monkeypatch.setattr(
-        gh_module, "issue_list", lambda label, state="open": [_make_issue(42)]
-    )
-    monkeypatch.setattr(gh_module, "issue_view", lambda n: _make_issue(n))
+    monkeypatch.setattr(loop_module, "_make_github_client", lambda: fake_gh)
 
     class RaisingSession(FakeCopilotSession):
         async def send_and_wait(self, prompt: str, *, timeout: float = 60.0, **_: Any) -> SessionEvent | None:
@@ -1116,27 +1042,21 @@ def test_loop_auto_close_failure_does_not_abort_iteration(tmp_path, monkeypatch)
     fake_git = FakeGitClient(tmp_path)
     monkeypatch.setattr(loop_module, "_make_git_client", lambda: fake_git)
 
-    monkeypatch.setattr(gh_module, "auth_status", lambda: True)
-    monkeypatch.setattr(
-        gh_module,
-        "repo_view",
-        lambda: gh_module.Repo(owner="x", name="y", default_branch="main"),
+    # The auto-close attempt fails for #42, but the iteration must not abort.
+    fake_gh = FakeGitHubClient(
+        repo=gh_module.Repo(owner="x", name="y", default_branch="main"),
+        issues=[_make_issue(42)],
+        issue_close_errors={
+            42: gh_module.GhError(
+                ["gh", "issue", "close", "42"], 1, "simulated close failure"
+            )
+        },
     )
-    monkeypatch.setattr(
-        gh_module, "issue_list", lambda label, state="open": [_make_issue(42)]
-    )
-    monkeypatch.setattr(gh_module, "issue_view", lambda n: _make_issue(n))
-
-    def raising_close(number: int, comment: str) -> None:
-        raise gh_module.GhError(
-            ["gh", "issue", "close", str(number)], 1, "simulated close failure"
-        )
-
-    monkeypatch.setattr(gh_module, "issue_close", raising_close)
+    monkeypatch.setattr(loop_module, "_make_github_client", lambda: fake_gh)
 
     fake_client = FakeCopilotClient(scripted_events=[])
     # The agent authors a commit referencing ``Closes #42`` mid-session; the
-    # subsequent auto-close attempt fails (raising_close) but must not abort.
+    # subsequent auto-close attempt fails (issue_close_errors) but must not abort.
     fake_client.on_send = lambda: fake_git.simulate_agent_commit(
         sha="deadbeef", subject="x", body="Closes #42"
     )
