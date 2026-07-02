@@ -24,6 +24,7 @@ from ralph_afk.git import (
     GitClient,
     GitError,
     SubprocessGitClient,
+    integration_branch_name,
     lane_branch_name,
 )
 
@@ -923,3 +924,59 @@ def test_delete_branch_raises_for_unknown_branch(tmp_path: Path) -> None:
     _repo, _siblings, client = _sibling_worktree_repo(tmp_path)
     with pytest.raises(GitError):
         client.delete_branch(lane_branch_name("RUN", 999))
+
+def _tree_sha(repo: Path, rev: str) -> str:
+    """Return the tree SHA a revision points at (for a tree-equality assertion)."""
+    completed = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", f"{rev}^{{tree}}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
+def test_revert_merge_undoes_a_landing_keeping_base_green(tmp_path: Path) -> None:
+    """``revert_merge`` reverts the ``HEAD`` merge, restoring the pre-merge tree (#63)."""
+    repo, branch, client = _committed_lane_branch(tmp_path, issue=7)
+    base_head = client.head_sha()
+    client.merge(branch)
+    merged_head = client.head_sha()
+    assert merged_head != base_head  # the --no-ff merge advanced base
+
+    client.revert_merge()
+
+    # A revert commit is appended (append-only: HEAD advances again, never a
+    # destructive reset), but the Lane's change is undone — the tree matches the
+    # pre-merge base, so the base branch is green again.
+    reverted_head = client.head_sha()
+    assert reverted_head != merged_head
+    assert _tree_sha(repo, "HEAD") == _tree_sha(repo, base_head)
+
+
+def test_abort_merge_undoes_an_in_progress_conflicted_merge(tmp_path: Path) -> None:
+    """``abort_merge`` restores base after a conflicting merge left it mid-merge (#63)."""
+    repo, branch, client = _committed_lane_branch(
+        tmp_path, issue=7, file_name="base.txt"
+    )
+    # Diverge base on the same file the Lane edited, so the merge conflicts.
+    _commit(repo, "base edit", file_name="base.txt", content="base version")
+    base_head = client.head_sha()
+    with pytest.raises(GitError):
+        client.merge(branch)  # conflicts, leaves the repo mid-merge
+
+    client.abort_merge()
+
+    # Base is exactly where it was and no longer mid-merge.
+    assert client.head_sha() == base_head
+    assert not (repo / ".git" / "MERGE_HEAD").exists()
+
+
+def test_integration_branch_name_uses_the_integrate_convention() -> None:
+    """The auto-resolution branch is distinct from the retained Lane branch (#63)."""
+    assert (
+        integration_branch_name("RUN123", 42)
+        == "copiloop/RUN123/integrate/issue-42"
+    )
+    # Distinct from the Lane breadcrumb branch for the same issue.
+    assert integration_branch_name("RUN123", 42) != lane_branch_name("RUN123", 42)

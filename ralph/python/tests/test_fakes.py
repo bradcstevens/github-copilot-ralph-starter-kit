@@ -261,6 +261,80 @@ def test_fake_delete_branch_raises_for_unknown_branch(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# FakeGitClient — Integration recovery: revert / abort / conflict (#63)
+# ---------------------------------------------------------------------------
+
+
+def test_fake_revert_merge_undoes_the_last_landing_keeping_base_green(
+    tmp_path: Path,
+) -> None:
+    """revert_merge pops the last merge's commits — base returns to pre-merge."""
+    parent = FakeGitClient(tmp_path, commits=[Commit(sha="base", subject="r", body="")])
+    base_head = parent.head_sha()
+    branch = "copiloop/R/issue-7"
+    lane = parent.add_worktree(tmp_path.parent / "wt-7", branch=branch, base="main")
+    lane.simulate_agent_commit(subject="feat: lane", body="Closes #7", sha="lane7")
+    parent.merge(branch)
+    assert parent.head_sha() == "lane7"  # landed
+
+    parent.revert_merge()
+
+    # Base is green again (back to its pre-merge head) and the revert is recorded.
+    assert parent.head_sha() == base_head
+    assert parent.commits_between(base_head, parent.head_sha()) == []
+    assert parent.reverts == [branch]
+
+
+def test_fake_revert_merge_raises_when_head_is_not_a_merge(tmp_path: Path) -> None:
+    """revert_merge with no landing to undo is a typed error (nothing to revert)."""
+    parent = FakeGitClient(tmp_path)
+    with pytest.raises(GitError):
+        parent.revert_merge()
+
+
+def test_fake_merge_conflict_raises_and_leaves_base_untouched(tmp_path: Path) -> None:
+    """A scripted conflicting Lane raises on merge and lands nothing on base."""
+    parent = FakeGitClient(
+        tmp_path,
+        commits=[Commit(sha="base", subject="r", body="")],
+        merge_conflicts=[7],
+    )
+    base_head = parent.head_sha()
+    branch = "copiloop/R/issue-7"
+    lane = parent.add_worktree(tmp_path.parent / "wt-7", branch=branch, base="main")
+    lane.simulate_agent_commit(subject="feat: lane", body="Closes #7", sha="lane7")
+
+    with pytest.raises(GitError):
+        parent.merge(branch)
+
+    # Nothing landed and the conflict was NOT recorded as a successful merge.
+    assert parent.head_sha() == base_head
+    assert parent.merge_calls == []
+
+    # The auto-resolution *integration* branch for the same issue is NOT
+    # scripted to conflict — it merges cleanly so recovery can land.
+    int_branch = "copiloop/R/integrate/issue-7"
+    resolver = parent.add_worktree(
+        tmp_path.parent / "wt-int-7", branch=int_branch, base="main"
+    )
+    resolver.simulate_agent_commit(subject="fix: resolve", body="Closes #7", sha="res7")
+    parent.merge(int_branch)
+    assert parent.head_sha() == "res7"
+    assert parent.merge_calls == [int_branch]
+
+
+def test_fake_abort_merge_records_the_abort(tmp_path: Path) -> None:
+    """abort_merge only bumps the spy — a conflicted merge appended nothing."""
+    parent = FakeGitClient(tmp_path, commits=[Commit(sha="base", subject="r", body="")])
+    base_head = parent.head_sha()
+
+    parent.abort_merge()
+
+    assert parent.merge_aborts == 1
+    assert parent.head_sha() == base_head
+
+
+# ---------------------------------------------------------------------------
 # FakeGitHubClient (the gh seam, #47)
 # ---------------------------------------------------------------------------
 
@@ -333,6 +407,28 @@ def test_issue_close_records_and_flips_state_to_closed() -> None:
     assert gh.issue_list("ready-for-agent") == []
 
 
+def test_issue_comment_records_without_changing_state() -> None:
+    # A breadcrumb comment (#63) is a pure spy — the issue stays OPEN.
+    gh = FakeGitHubClient(issues=[_issue(42)])
+    gh.issue_comment(42, "auto-resolution exhausted; falling back to serial")
+
+    assert gh.issue_comment_calls == [
+        (42, "auto-resolution exhausted; falling back to serial")
+    ]
+    assert gh.issue_view(42).state == "OPEN"
+    assert gh.issue_close_calls == []
+
+
+def test_issue_comment_error_still_records_the_attempt() -> None:
+    gh = FakeGitHubClient(
+        issues=[_issue(42)],
+        issue_comment_errors={42: GhError(["gh"], 1, "boom")},
+    )
+    with pytest.raises(GhError):
+        gh.issue_comment(42, "note")
+    assert gh.issue_comment_calls == [(42, "note")]
+
+
 def test_pr_list_view_and_head_advance() -> None:
     gh = FakeGitHubClient(prs=[_pr(7, head_sha="old"), _pr(8, state="MERGED")])
     assert [p.number for p in gh.pr_list("ready-for-agent")] == [7]
@@ -351,6 +447,7 @@ def test_pr_list_view_and_head_advance() -> None:
         ({"issue_list_error": GhError(["gh"], 1, "boom")}, lambda gh: gh.issue_list("l")),
         ({"issue_view_errors": {42: GhError(["gh"], 1, "boom")}}, lambda gh: gh.issue_view(42)),
         ({"issue_close_errors": {42: GhError(["gh"], 1, "boom")}}, lambda gh: gh.issue_close(42, "c")),
+        ({"issue_comment_errors": {42: GhError(["gh"], 1, "boom")}}, lambda gh: gh.issue_comment(42, "c")),
         ({"pr_list_error": GhError(["gh"], 1, "boom")}, lambda gh: gh.pr_list("l")),
         ({"pr_view_errors": {7: GhError(["gh"], 1, "boom")}}, lambda gh: gh.pr_view(7)),
     ],

@@ -1497,6 +1497,9 @@ class _NoopSource:
     ) -> list[Any]:
         return []
 
+    def comment(self, ref: int | str, body: str) -> None:
+        return None
+
 
 class _RecordingSink:
     """Records each envelope handed to ``render`` (the sink contract surface)."""

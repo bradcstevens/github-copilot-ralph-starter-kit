@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -218,7 +219,20 @@ def _logged_events(tmp_path: Path) -> list[dict[str, Any]]:
     return [json.loads(raw) for raw in lines]
 
 
-def _wire_repo(tmp_path: Path) -> FakeGitClient:
+def _run_id(tmp_path: Path) -> str:
+    """Recover the run's ULID from the logged event envelopes.
+
+    Every event carries ``run_id`` (see ``events._envelope``), so the Lane /
+    integration branch names a test needs to assert on can be reconstructed via
+    ``git.lane_branch_name`` / ``git.integration_branch_name`` without the test
+    having to know the run id a priori.
+    """
+    return _logged_events(tmp_path)[0]["run_id"]
+
+
+def _wire_repo(
+    tmp_path: Path, *, merge_conflicts: Sequence[int] = ()
+) -> FakeGitClient:
     (tmp_path / "ralph").mkdir()
     (tmp_path / "ralph" / "prompt.md").write_text(
         "You are ralph. Implement the AFK-ready issues.\n", encoding="utf-8"
@@ -236,6 +250,7 @@ def _wire_repo(tmp_path: Path) -> FakeGitClient:
         ],
         dirty=False,
         untracked=False,
+        merge_conflicts=merge_conflicts,
     )
 
 
@@ -485,15 +500,16 @@ def test_parallel_integration_lands_and_closes_in_ascending_issue_order(
 def test_parallel_integration_red_gate_keeps_branch_and_records_strike(
     tmp_path, monkeypatch
 ) -> None:
-    """A red gate lands nothing: no closures, branches kept, and the round strikes.
+    """Red-throughout Integration: revert keeps base green, falls back to serial.
 
-    Happy-path Integration (#62) skips a Lane whose feedback loops go red,
-    leaving its branch as a breadcrumb (revert + auto-resolution is #63). With
-    every Lane's gate red, the Wave lands nothing — and since a successful
-    Integration is the round's only Strike-progress signal, the no-progress
-    round adds one strike. This is the contrapositive of "a successful
-    Integration counts as Strike progress": a Wave that integrates nothing is
-    not progress. Assertions are on observable effects only.
+    Evolves the #62 happy-path contract deliberately (#63, ADR-0009). With every
+    Lane's gate red *and* every auto-resolution attempt red, each Lane: merges
+    cleanly, gates red, is **reverted** so base stays green, runs the bounded
+    K=3 auto-resolution agent (all red), then falls back to a serial Iteration
+    with **exactly one** breadcrumb comment — its Lane branch **kept** (only the
+    throwaway integration branch is deleted). Nothing lands, so the no-progress
+    Wave records exactly one warn strike (a Wave that integrates nothing is not
+    progress). Assertions are on observable effects only.
     """
     fake_git = _wire_repo(tmp_path)
     monkeypatch.setattr(loop_module, "_make_git_client", lambda: fake_git)
@@ -512,7 +528,8 @@ def test_parallel_integration_red_gate_keeps_branch_and_records_strike(
         scripted_events=[_usage_event("claude-opus-4.8-max")],
     )
     monkeypatch.setattr(loop_module, "_make_client", lambda: fake_client)
-    # All-red gate: every Lane's feedback loops fail, so no Lane lands.
+    # All-red gate: every Lane's feedback loops fail on the initial landing AND
+    # on every auto-resolution attempt, so no Lane ever lands.
     monkeypatch.setattr(
         loop_module, "_make_gate_runner", lambda: FakeGateRunner(default=False)
     )
@@ -532,13 +549,22 @@ def test_parallel_integration_red_gate_keeps_branch_and_records_strike(
     # One warn strike (1 < 3) does not abort the run; the iteration cap ends it.
     assert exit_code == 0, f"expected exit 0, got {exit_code}"
 
-    # Nothing landed: no issue closed and both remain OPEN.
+    # Nothing landed: no issue closed and both remain OPEN for the serial round.
     assert fake_gh.issue_close_calls == []
     assert fake_gh.issue_view(42).state == "OPEN"
     assert fake_gh.issue_view(43).state == "OPEN"
 
-    # Both Lane branches kept as breadcrumbs (a red gate deletes nothing).
-    assert fake_git.branch_deletes == []
+    # Base stayed green: each clean-but-red landing was reverted (one per Lane).
+    assert len(fake_git.reverts) == 2
+
+    # Both Lane branches are KEPT as breadcrumbs; only the two throwaway
+    # integration branches are deleted (a fallback deletes no Lane branch).
+    assert len(fake_git.branch_deletes) == 2
+    assert all("/integrate/" in b for b in fake_git.branch_deletes)
+
+    # Exactly one breadcrumb comment per terminal fallback (one per Lane), and
+    # the comment resolves nothing (both issues stay OPEN, asserted above).
+    assert sorted(n for n, _ in fake_gh.issue_comment_calls) == [42, 43]
 
     # The no-progress Wave recorded exactly one warn strike, and Integration
     # closed nothing.
@@ -548,6 +574,250 @@ def test_parallel_integration_red_gate_keeps_branch_and_records_strike(
     assert strikes[0]["outcome"] == "warn"
     assert strikes[0]["strikes"] == 1
     assert [e for e in events if e["type"] == "wrapper.auto_close"] == []
+
+
+def test_parallel_integration_auto_resolves_red_lane_then_lands(
+    tmp_path, monkeypatch
+) -> None:
+    """A red Lane is reverted, auto-resolved on a later attempt, and lands (#63).
+
+    Issue 42's Lane merges cleanly but its gate goes red on the initial landing
+    AND on the first auto-resolution attempt, then passes on the second attempt;
+    issue 43 is green throughout. The scripted gate is a global call-ordered
+    queue ``[42-postmerge=red, 42-att1=red, 42-att2=green]`` with the default
+    (green) covering 43. Asserts (observable effects only): base is reverted
+    once (stays green), the K-bounded auto-resolution agent runs exactly twice
+    for 42 in its dedicated integration worktree, both issues end CLOSED with one
+    ``auto_close`` each, no breadcrumb is posted, and — because two Integrations
+    landed — the round records no strike.
+    """
+    fake_git = _wire_repo(tmp_path)
+    monkeypatch.setattr(loop_module, "_make_git_client", lambda: fake_git)
+
+    fake_gh = FakeGitHubClient(
+        repo=gh_module.Repo(owner="x", name="y", default_branch="main"),
+        issues=[
+            _make_issue(42, labels=["ready-for-agent", "parallel-safe"]),
+            _make_issue(43, labels=["ready-for-agent", "parallel-safe"]),
+        ],
+    )
+    monkeypatch.setattr(loop_module, "_make_github_client", lambda: fake_gh)
+
+    fake_client = _ParallelFakeClient(
+        fake_git=fake_git,
+        scripted_events=[_usage_event("claude-opus-4.8-max")],
+    )
+    monkeypatch.setattr(loop_module, "_make_client", lambda: fake_client)
+    # 42 is red on its initial landing and its first auto-resolution attempt,
+    # green on the second; 43 (default) is green.
+    monkeypatch.setattr(
+        loop_module,
+        "_make_gate_runner",
+        lambda: FakeGateRunner(outcomes=[False, False, True], default=True),
+    )
+
+    cfg = RunConfig(
+        model="claude-opus-4.8-max",
+        issue_source="github",
+        parallel=2,
+        max_iterations=1,
+        max_nmt_strikes=3,
+        verbosity=0,
+        render_reasoning=False,
+    )
+
+    exit_code = asyncio.run(loop_module.run(cfg))
+    assert exit_code == 0, f"expected exit 0, got {exit_code}"
+
+    # Base stayed green: the clean-but-red landing of 42 was reverted exactly
+    # once (43 was green on its first landing, so it was never reverted).
+    assert fake_git.reverts == [git_module.lane_branch_name(_run_id(tmp_path), 42)]
+
+    # The K-bounded auto-resolution agent ran exactly twice for 42, each session
+    # pinned to 42's dedicated integration worktree (never 43's).
+    resolution_dirs = [
+        c["working_directory"]
+        for c in fake_client.create_calls
+        if c["working_directory"] and "/integrate/" in c["working_directory"]
+    ]
+    assert len(resolution_dirs) == 2
+    assert all(wd.endswith("/issue-42") for wd in resolution_dirs)
+
+    # Both issues landed and closed — 42 via auto-resolution, 43 via the happy
+    # path — with exactly one auto_close each and no breadcrumb (no fallback).
+    assert sorted(n for (n, _c) in fake_gh.issue_close_calls) == [42, 43]
+    assert fake_gh.issue_view(42).state == "CLOSED"
+    assert fake_gh.issue_view(43).state == "CLOSED"
+    assert fake_gh.issue_comment_calls == []
+
+    events = _logged_events(tmp_path)
+    assert [
+        e["issue"] for e in events if e["type"] == "wrapper.auto_close"
+    ] == [42, 43]
+    # Two Integrations landed = progress, so the round records no strike.
+    assert [e for e in events if e["type"] == "wrapper.strike"] == []
+
+
+def test_parallel_integration_aborts_conflicting_merge_then_auto_resolves(
+    tmp_path, monkeypatch
+) -> None:
+    """A conflicting Lane merge is aborted (not reverted), then auto-resolved (#63).
+
+    Issue 42's Lane branch is scripted to *conflict* on merge; issue 43 merges
+    cleanly. A conflict leaves no merge to revert, so recovery must
+    ``git merge --abort`` (not ``git revert``) to keep base green, then run the
+    auto-resolution agent — which passes on its first attempt here (all-green
+    gate) and lands 42. Asserts the abort fired exactly once, no revert
+    happened, both issues closed, and the round made progress (no strike).
+    """
+    fake_git = _wire_repo(tmp_path, merge_conflicts=[42])
+    monkeypatch.setattr(loop_module, "_make_git_client", lambda: fake_git)
+
+    fake_gh = FakeGitHubClient(
+        repo=gh_module.Repo(owner="x", name="y", default_branch="main"),
+        issues=[
+            _make_issue(42, labels=["ready-for-agent", "parallel-safe"]),
+            _make_issue(43, labels=["ready-for-agent", "parallel-safe"]),
+        ],
+    )
+    monkeypatch.setattr(loop_module, "_make_github_client", lambda: fake_gh)
+
+    fake_client = _ParallelFakeClient(
+        fake_git=fake_git,
+        scripted_events=[_usage_event("claude-opus-4.8-max")],
+    )
+    monkeypatch.setattr(loop_module, "_make_client", lambda: fake_client)
+    # All-green gate: the conflict is a *merge* failure, not a gate failure, so
+    # 42's first auto-resolution attempt (and 43's landing) pass.
+    monkeypatch.setattr(
+        loop_module, "_make_gate_runner", lambda: FakeGateRunner(default=True)
+    )
+
+    cfg = RunConfig(
+        model="claude-opus-4.8-max",
+        issue_source="github",
+        parallel=2,
+        max_iterations=1,
+        max_nmt_strikes=3,
+        verbosity=0,
+        render_reasoning=False,
+    )
+
+    exit_code = asyncio.run(loop_module.run(cfg))
+    assert exit_code == 0, f"expected exit 0, got {exit_code}"
+
+    # The conflict path aborts (base stays green) and never reverts.
+    assert fake_git.merge_aborts == 1
+    assert fake_git.reverts == []
+
+    # 42 was recovered by exactly one auto-resolution attempt in its dedicated
+    # integration worktree; 43 landed via the happy path.
+    resolution_dirs = [
+        c["working_directory"]
+        for c in fake_client.create_calls
+        if c["working_directory"] and "/integrate/" in c["working_directory"]
+    ]
+    assert resolution_dirs == [
+        str(
+            loop_module._integration_worktree_path(
+                tmp_path, _run_id(tmp_path), 42
+            )
+        )
+    ]
+
+    # Both issues closed; no breadcrumb (no fallback); the round made progress.
+    assert sorted(n for (n, _c) in fake_gh.issue_close_calls) == [42, 43]
+    assert fake_gh.issue_view(42).state == "CLOSED"
+    assert fake_gh.issue_view(43).state == "CLOSED"
+    assert fake_gh.issue_comment_calls == []
+    events = _logged_events(tmp_path)
+    assert [e for e in events if e["type"] == "wrapper.strike"] == []
+
+
+def test_parallel_integration_falls_back_to_serial_after_k_attempts(
+    tmp_path, monkeypatch
+) -> None:
+    """K=3 terminal failure falls back to a serial Iteration with one breadcrumb (#63).
+
+    Issue 42's gate is red on its initial landing AND on all K=3 auto-resolution
+    attempts (four reds), so it terminally fails Integration; issue 43 is green.
+    With ``max_iterations=0`` and ``serial_closes`` the run then drains: the Wave
+    lands 43, 42 falls back to a serial Iteration, and a later serial round works
+    42 to closure. Asserts base stayed green (reverted), the auto-resolution
+    agent ran exactly K=3 times, exactly ONE breadcrumb comment was posted on 42,
+    42's Lane branch was KEPT (only its throwaway integration branch deleted),
+    and the run drained the pool (both issues CLOSED, ``empty_pool``).
+    """
+    fake_git = _wire_repo(tmp_path)
+    monkeypatch.setattr(loop_module, "_make_git_client", lambda: fake_git)
+
+    fake_gh = FakeGitHubClient(
+        repo=gh_module.Repo(owner="x", name="y", default_branch="main"),
+        issues=[
+            _make_issue(42, labels=["ready-for-agent", "parallel-safe"]),
+            _make_issue(43, labels=["ready-for-agent", "parallel-safe"]),
+        ],
+    )
+    monkeypatch.setattr(loop_module, "_make_github_client", lambda: fake_gh)
+
+    fake_client = _ParallelFakeClient(
+        fake_git=fake_git,
+        scripted_events=[_usage_event("claude-opus-4.8-max")],
+        serial_closes=True,
+    )
+    monkeypatch.setattr(loop_module, "_make_client", lambda: fake_client)
+    # 42 red on its landing + all K=3 attempts (four reds); 43 (default) green.
+    monkeypatch.setattr(
+        loop_module,
+        "_make_gate_runner",
+        lambda: FakeGateRunner(outcomes=[False, False, False, False], default=True),
+    )
+
+    cfg = RunConfig(
+        model="claude-opus-4.8-max",
+        issue_source="github",
+        parallel=2,
+        max_iterations=0,  # unlimited: drive until the pool drains
+        max_nmt_strikes=3,
+        verbosity=0,
+        render_reasoning=False,
+    )
+
+    exit_code = asyncio.run(loop_module.run(cfg))
+    assert exit_code == 0, f"expected a clean drain (exit 0), got {exit_code}"
+
+    # Base stayed green: 42's clean-but-red landing was reverted.
+    assert git_module.lane_branch_name(_run_id(tmp_path), 42) in fake_git.reverts
+
+    # The auto-resolution agent ran exactly K=3 times for 42 (the bound holds),
+    # each session pinned to 42's dedicated integration worktree.
+    resolution_dirs = [
+        c["working_directory"]
+        for c in fake_client.create_calls
+        if c["working_directory"] and "/integrate/" in c["working_directory"]
+    ]
+    assert len(resolution_dirs) == loop_module._AUTO_RESOLUTION_MAX_ATTEMPTS
+    assert all(wd.endswith("/issue-42") for wd in resolution_dirs)
+
+    # Exactly ONE automated breadcrumb was posted on 42 for the fallback.
+    assert [n for (n, _b) in fake_gh.issue_comment_calls] == [42]
+
+    # 42's Lane branch is KEPT as a breadcrumb; only its throwaway integration
+    # branch was deleted (the fallback deletes no Lane branch).
+    lane_42 = git_module.lane_branch_name(_run_id(tmp_path), 42)
+    assert lane_42 not in fake_git.branch_deletes
+    assert (
+        git_module.integration_branch_name(_run_id(tmp_path), 42)
+        in fake_git.branch_deletes
+    )
+
+    # The run drained the pool: 42 closed via the serial fallback round, 43 via
+    # Integration; the run ended on empty_pool, not the iteration cap.
+    assert fake_gh.issue_view(42).state == "CLOSED"
+    assert fake_gh.issue_view(43).state == "CLOSED"
+    events = _logged_events(tmp_path)
+    run_end = next(e for e in events if e["type"] == "wrapper.run.end")
+    assert run_end["outcome"] == "empty_pool"
 
 
 def test_parallel_run_drains_waves_then_serial_in_one_run(

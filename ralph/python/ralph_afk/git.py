@@ -231,6 +231,26 @@ def lane_branch_name(run_id: str, issue_number: int) -> str:
     return f"copiloop/{run_id}/issue-{issue_number}"
 
 
+def integration_branch_name(run_id: str, issue_number: int) -> str:
+    """Return the branch name for a Parallel-mode auto-resolution attempt.
+
+    Integration recovery (#63, ADR-0009) merges a red / conflicting **Lane** on a
+    dedicated *integration* branch in its own worktree, so the base branch is
+    never touched until the feedback loops pass. The branch follows the
+    **copiloop** convention (ADR-0005) with an ``integrate/`` segment that keeps
+    it distinct from the retained Lane breadcrumb branch
+    (:func:`lane_branch_name`): ``copiloop/<run_id>/integrate/issue-<N>``.
+
+    Args:
+        run_id: The run identifier.
+        issue_number: The Lane's ``parallel-safe`` issue number.
+
+    Returns:
+        ``f"copiloop/{run_id}/integrate/issue-{issue_number}"``.
+    """
+    return f"copiloop/{run_id}/integrate/issue-{issue_number}"
+
+
 # --------------------------------------------------------------------------- #
 # GitClient seam                                                              #
 # --------------------------------------------------------------------------- #
@@ -356,6 +376,36 @@ class GitClient(Protocol):
 
         Raises:
             GitError: If the branch does not exist or ``git`` refuses to delete it.
+        """
+        ...
+
+    def revert_merge(self) -> None:
+        """Revert the merge commit at ``HEAD`` so the base branch stays green.
+
+        Integration recovery (#63, ADR-0009): when a Lane merged cleanly but the
+        feedback loops then went red, undo that landing. Because :meth:`merge`
+        always creates a ``--no-ff`` merge commit, ``HEAD`` is that merge, so a
+        single ``git revert -m 1 --no-edit HEAD`` reverts it against the first
+        parent (the base side) — restoring the pre-merge tree while keeping
+        history append-only (never a destructive reset of a possibly-pushed
+        base).
+
+        Raises:
+            GitError: If ``git`` is not on PATH or ``HEAD`` is not a revertable
+                merge commit.
+        """
+        ...
+
+    def abort_merge(self) -> None:
+        """Abort an in-progress conflicted merge, restoring the base branch.
+
+        Integration recovery (#63, ADR-0009) for the *conflict* case: a
+        :meth:`merge` that conflicts leaves the repo mid-merge; ``git merge
+        --abort`` unwinds it so the base branch is exactly where it was before
+        the merge attempt (green), ready for the auto-resolution agent.
+
+        Raises:
+            GitError: If ``git`` is not on PATH or there is no merge to abort.
         """
         ...
 
@@ -749,6 +799,26 @@ class SubprocessGitClient:
             GitError: If ``git`` is not on PATH or ``branch`` does not exist.
         """
         _run(["branch", "-D", branch], cwd=self._root)
+
+    def revert_merge(self) -> None:
+        """Revert the ``HEAD`` merge via ``git revert -m 1 --no-edit HEAD``.
+
+        Run from the repo root right after a clean :meth:`merge` whose gate then
+        went red. ``-m 1`` reverts against the merge's first parent (the base
+        side) so the Lane's change is undone and the pre-merge tree restored;
+        ``--no-edit`` takes git's default revert message non-interactively. The
+        base branch stays green **and** append-only (see :meth:`GitClient.
+        revert_merge`).
+        """
+        _run(["revert", "-m", "1", "--no-edit", "HEAD"], cwd=self._root)
+
+    def abort_merge(self) -> None:
+        """Abort an in-progress merge via ``git merge --abort``.
+
+        Run from the repo root after a :meth:`merge` conflicted and left the repo
+        mid-merge, restoring the base branch to its exact pre-merge state.
+        """
+        _run(["merge", "--abort"], cwd=self._root)
 
 
 # --------------------------------------------------------------------------- #

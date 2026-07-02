@@ -37,6 +37,7 @@ repo_view = _client.repo_view
 issue_list = _client.issue_list
 issue_view = _client.issue_view
 issue_close = _client.issue_close
+issue_comment = _client.issue_comment
 pr_list = _client.pr_list
 pr_view = _client.pr_view
 
@@ -475,6 +476,40 @@ def test_issue_close_nonzero_close_subprocess_raises(monkeypatch) -> None:
     _install_fake_run(monkeypatch, fake_run)
     with pytest.raises(GhError) as exc_info:
         issue_close(42, "comment body")
+    assert exc_info.value.returncode == 1
+
+
+# --------------------------------------------------------------------------- #
+# issue_comment (breadcrumb: comment without closing, #63)                     #
+# --------------------------------------------------------------------------- #
+
+
+def test_issue_comment_posts_body_without_closing(monkeypatch) -> None:
+    """``issue_comment`` runs one ``gh issue comment N --body`` and never closes."""
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return _completed(cmd, code=0)
+
+    _install_fake_run(monkeypatch, fake_run)
+    issue_comment(42, "auto-resolution exhausted; falling back to serial")
+
+    # Exactly one subprocess: the comment. No close, no state verify.
+    assert len(calls) == 1
+    assert calls[0][-5:] == ["issue", "comment", "42", "--body", "auto-resolution exhausted; falling back to serial"]
+    assert "close" not in calls[0]
+
+
+def test_issue_comment_nonzero_subprocess_raises(monkeypatch) -> None:
+    """A failing comment subprocess surfaces a typed ``GhError``."""
+
+    def fake_run(cmd, **kw):
+        return _completed(cmd, code=1, stderr="not found\n")
+
+    _install_fake_run(monkeypatch, fake_run)
+    with pytest.raises(GhError) as exc_info:
+        issue_comment(42, "body")
     assert exc_info.value.returncode == 1
 
 

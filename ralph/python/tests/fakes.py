@@ -70,6 +70,7 @@ class FakeGitClient:
         commit_error: GitError | None = None,
         push_error: GitError | None = None,
         sha_prefix: str = "face",
+        merge_conflicts: Sequence[int] | None = None,
     ) -> None:
         self._root = Path(root)
         self._sha_counter = 0
@@ -109,6 +110,20 @@ class FakeGitClient:
         self._branches: dict[str, FakeGitClient] = {}
         self.merge_calls: list[str] = []
         self.branch_deletes: list[str] = []
+        # Integration recovery (#63 / ADR-0009). ``merge_conflicts`` scripts the
+        # issue numbers whose **Lane** branch raises on :meth:`merge` (models a
+        # conflicting landing) so a test drives the abort + auto-resolution path.
+        # Matched on the Lane branch shape (``.../issue-<N>``) and NOT on the
+        # auto-resolution *integration* branch (``.../integrate/issue-<N>``), so
+        # the resolved branch still merges cleanly. A stack of per-merge deltas
+        # (branch + the SHAs that landing appended) lets :meth:`revert_merge` pop
+        # the last landing and restore the pre-merge base — the net effect of
+        # ``git revert -m 1`` in this linear-log model. :attr:`reverts` /
+        # :attr:`merge_aborts` are spies.
+        self._merge_conflict_issues: set[int] = set(merge_conflicts or ())
+        self._merge_deltas: list[tuple[str, list[str]]] = []
+        self.reverts: list[str] = []
+        self.merge_aborts: int = 0
 
     @property
     def root(self) -> Path:
@@ -248,6 +263,20 @@ class FakeGitClient:
         """
         return self._worktrees.get(Path(path))
 
+    def _branch_conflicts(self, branch: str) -> bool:
+        """Whether a scripted merge conflict applies to ``branch`` (#63).
+
+        Matches only the **Lane** branch for a scripted issue
+        (``.../issue-<N>``), never its auto-resolution *integration* branch
+        (``.../integrate/issue-<N>``) — so a conflicting Lane's resolved branch
+        still merges cleanly.
+        """
+        if "/integrate/" in branch:
+            return False
+        return any(
+            branch.endswith(f"/issue-{n}") for n in self._merge_conflict_issues
+        )
+
     def merge(self, branch: str) -> None:
         """Model ``git merge --no-ff <branch>`` — land a Lane branch on base.
 
@@ -256,19 +285,62 @@ class FakeGitClient:
         those whose SHA is not already in this base log — advancing ``head_sha`` and
         making them visible to ``commits_between(pre, post)`` so Integration can read
         the landed ``Closes #N`` commit and drive closure. Records the branch in
-        :attr:`merge_calls`.
+        :attr:`merge_calls` and the appended SHAs as a revertable delta (#63).
 
         Raises:
-            GitError: If ``branch`` is unknown (never added, or already deleted).
+            GitError: If ``branch`` is unknown (never added, or already deleted),
+                or if ``branch`` is scripted to conflict via ``merge_conflicts``
+                (models a conflicting landing — nothing is appended).
         """
         child = self._branches.get(branch)
         if child is None:
             raise GitError(["git", "merge", "--no-ff", branch], 1, f"merge: {branch}")
+        if self._branch_conflicts(branch):
+            # A scripted conflict: base is left mid-merge (nothing landed) for
+            # the caller to :meth:`abort_merge`.
+            raise GitError(
+                ["git", "merge", "--no-ff", branch], 1, f"conflict: {branch}"
+            )
         self.merge_calls.append(branch)
         known = {commit.sha for commit in self._log}
+        appended: list[str] = []
         for commit in child._log:
             if commit.sha not in known:
                 self._log.append(commit)
+                appended.append(commit.sha)
+        self._merge_deltas.append((branch, appended))
+
+    def revert_merge(self) -> None:
+        """Model ``git revert -m 1 --no-edit HEAD`` — undo the last landing (#63).
+
+        Pops the most recent :meth:`merge` delta and removes those commits from
+        this base log, so ``head_sha`` returns to the pre-merge base (green) — the
+        net effect of a real ``git revert -m 1`` in this linear-log model, without
+        modelling the extra inverse commit git would append. Records the reverted
+        branch in :attr:`reverts`.
+
+        Raises:
+            GitError: If there is no landing to revert (``HEAD`` is not a merge).
+        """
+        if not self._merge_deltas:
+            raise GitError(
+                ["git", "revert", "-m", "1", "--no-edit", "HEAD"],
+                1,
+                "no merge to revert",
+            )
+        branch, appended = self._merge_deltas.pop()
+        removed = set(appended)
+        self._log = [c for c in self._log if c.sha not in removed]
+        self.reverts.append(branch)
+
+    def abort_merge(self) -> None:
+        """Model ``git merge --abort`` — unwind a conflicted merge (#63).
+
+        A conflicting :meth:`merge` appended nothing to the base log (it raised),
+        so the base is already at its pre-merge state; this only records the
+        abort in :attr:`merge_aborts` for assertions.
+        """
+        self.merge_aborts += 1
 
     def delete_branch(self, branch: str) -> None:
         """Model ``git branch -D <branch>`` — drop an integrated Lane branch.
@@ -381,6 +453,7 @@ class FakeGitHubClient:
         pr_list_error: GhError | None = None,
         issue_view_errors: Mapping[int, GhError] | None = None,
         issue_close_errors: Mapping[int, GhError] | None = None,
+        issue_comment_errors: Mapping[int, GhError] | None = None,
         pr_view_errors: Mapping[int, GhError] | None = None,
     ) -> None:
         self.authed = authed
@@ -400,11 +473,15 @@ class FakeGitHubClient:
         # Per-number injected failures (a single item fails; the pool proceeds).
         self._issue_view_errors: dict[int, GhError] = dict(issue_view_errors or {})
         self._issue_close_errors: dict[int, GhError] = dict(issue_close_errors or {})
+        self._issue_comment_errors: dict[int, GhError] = dict(
+            issue_comment_errors or {}
+        )
         self._pr_view_errors: dict[int, GhError] = dict(pr_view_errors or {})
         # Read/write spies.
         self.issue_list_calls: list[tuple[str, str]] = []
         self.issue_view_calls: list[int] = []
         self.issue_close_calls: list[tuple[int, str]] = []
+        self.issue_comment_calls: list[tuple[int, str]] = []
         self.pr_list_calls: list[tuple[str, str]] = []
         self.pr_view_calls: list[int] = []
 
@@ -450,6 +527,20 @@ class FakeGitHubClient:
         existing = self._issues.get(number)
         if existing is not None:
             self._issues[number] = replace(existing, state="CLOSED")
+
+    def issue_comment(self, number: int, comment: str) -> None:
+        """Record a breadcrumb comment (#63) — never changes the issue state.
+
+        Appends to :attr:`issue_comment_calls` and, unlike :meth:`issue_close`,
+        leaves the stored issue's ``state`` untouched (a comment resolves
+        nothing). Per-number ``issue_comment_errors`` inject a
+        :exc:`~ralph_afk.gh.GhError` so a test drives the source's
+        breadcrumb-resilience path.
+        """
+        self.issue_comment_calls.append((number, comment))
+        err = self._issue_comment_errors.get(number)
+        if err is not None:
+            raise err
 
     def pr_list(self, label: str, state: str = "open") -> list[PullRequest]:
         self.pr_list_calls.append((label, state))

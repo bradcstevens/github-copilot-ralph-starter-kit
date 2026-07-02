@@ -411,6 +411,17 @@ class GitHubClient(Protocol):
         """Close an issue with a wrap-up comment and verify the close landed."""
         ...
 
+    def issue_comment(self, number: int, comment: str) -> None:
+        """Post a comment on an issue **without** changing its state.
+
+        A pure recorded mechanic used by the Integration serial-fallback
+        breadcrumb (#63, ADR-0009): when auto-resolution exhausts its K=3
+        attempts, the runner leaves exactly one automated comment on the issue
+        and lets a later serial **Iteration** land it. Never closes or relabels
+        — that is the source/loop policy, never the client's.
+        """
+        ...
+
     def pr_list(self, label: str, state: str = "open") -> list[PullRequest]:
         """List pull requests filtered by ``label`` / ``state`` (``comments`` empty)."""
         ...
@@ -578,6 +589,18 @@ class SubprocessGitHubClient:
                 f"gh issue close #{number} returned success but state is "
                 f"{verify_state!r}, not 'CLOSED'.",
             )
+
+    def issue_comment(self, number: int, comment: str) -> None:
+        """Post a comment on ``number`` via ``gh issue comment N --body``.
+
+        A recorded mechanic that leaves the issue OPEN (the Integration
+        serial-fallback breadcrumb, #63). The body is passed via argv (no
+        shell), so no escaping is required for the caller.
+
+        Raises:
+            GhError: If the comment subprocess fails.
+        """
+        _run(["issue", "comment", str(number), "--body", comment])
 
     def pr_list(self, label: str, state: str = "open") -> list[PullRequest]:
         """List pull requests filtered by label and state.

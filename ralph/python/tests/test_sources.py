@@ -425,8 +425,54 @@ class TestGitHubHandleCompletions:
 
 
 # --------------------------------------------------------------------------- #
-# PrdsIssueSource.preflight                                                   #
+# GitHubIssueSource.comment / PrdsIssueSource.comment  (#63 breadcrumb seam)   #
 # --------------------------------------------------------------------------- #
+
+
+class TestGitHubComment:
+    def test_delegates_an_int_ref_to_gh_issue_comment(self) -> None:
+        gh = FakeGitHubClient(issues=[_make_issue(42)])
+        impl = GitHubIssueSource(_silent_logger(), gh=gh)
+
+        impl.comment(42, "auto-resolution exhausted; falling back to serial")
+
+        assert gh.issue_comment_calls == [
+            (42, "auto-resolution exhausted; falling back to serial")
+        ]
+        # A comment resolves nothing — the issue stays OPEN for the serial round.
+        assert gh.issue_close_calls == []
+
+    def test_ignores_a_non_int_ref(self) -> None:
+        gh = FakeGitHubClient()
+        impl = GitHubIssueSource(_silent_logger(), gh=gh)
+
+        impl.comment("PRD-7", "note")
+
+        assert gh.issue_comment_calls == []
+
+    def test_comment_failure_is_swallowed(self) -> None:
+        # A failed breadcrumb must not propagate — the fallback proceeds
+        # without the note rather than aborting the Wave barrier.
+        gh = FakeGitHubClient(
+            issues=[_make_issue(42)],
+            issue_comment_errors={42: gh_module.GhError(["gh"], 1, "boom")},
+        )
+        impl = GitHubIssueSource(_silent_logger(), gh=gh)
+
+        impl.comment(42, "note")  # must not raise
+
+        assert gh.issue_comment_calls == [(42, "note")]
+
+
+class TestPrdsComment:
+    def test_is_a_no_op(self, tmp_path: Path) -> None:
+        # The local markdown backend never runs Integration recovery, so a
+        # breadcrumb has nowhere to go — the call is a silent no-op.
+        impl = PrdsIssueSource(tmp_path, _silent_logger())
+        impl.comment(42, "note")  # must not raise
+
+
+
 
 
 class TestPrdsPreflight:

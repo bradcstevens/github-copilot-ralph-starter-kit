@@ -240,6 +240,16 @@ class IssueSource(Protocol):
         """
         ...
 
+    def comment(self, ref: int | str, body: str) -> None:
+        """Post one automated breadcrumb comment on ``ref`` without resolving it.
+
+        Used by Parallel-mode Integration recovery (#63, ADR-0009): when
+        auto-resolution exhausts its K=3 attempts the runner leaves exactly one
+        comment on the issue and defers it to a later serial **Iteration**. A
+        no-op for a source with no per-item comment channel (the PRDs backend).
+        """
+        ...
+
 
 # --------------------------------------------------------------------------- #
 # GitHub backend                                                              #
@@ -432,6 +442,25 @@ class GitHubIssueSource:
             completions.extend(self._detect_pr_advances(pool))
         completions.extend(self._handle_issue_closures(pool, new_commits))
         return completions
+
+    def comment(self, ref: int | str, body: str) -> None:
+        """Post one breadcrumb comment via the injected client (non-fatal).
+
+        Only integer issue refs are commentable; a non-int ref, or a client
+        failure, is logged and swallowed so a failed breadcrumb never aborts the
+        Wave barrier — the issue simply falls through to a serial **Iteration**
+        without the note.
+        """
+        if not isinstance(ref, int):
+            return
+        try:
+            self._gh.issue_comment(ref, body)
+        except gh_module.GhError as exc:
+            self._diag.warning(
+                "gh issue comment #%s failed: %s; continuing without breadcrumb",
+                ref,
+                exc,
+            )
 
     def _detect_pr_advances(
         self, pool: list[AfkReadyItem]
@@ -764,3 +793,12 @@ class PrdsIssueSource:
         _ = pool
         _ = new_commits
         return []
+
+    def comment(self, ref: int | str, body: str) -> None:
+        """No-op — the PRDs backend has no per-issue comment channel.
+
+        Integration recovery (#63) is Parallel-mode / GitHub-only; the local
+        markdown backend never runs it, so the breadcrumb has nowhere to go.
+        """
+        _ = ref
+        _ = body

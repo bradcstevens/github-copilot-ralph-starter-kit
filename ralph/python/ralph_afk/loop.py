@@ -396,6 +396,41 @@ def _lane_worktree_path(
     )
 
 
+_AUTO_RESOLUTION_MAX_ATTEMPTS = 3
+"""K — the bound on auto-resolution attempts before serial fallback (#63)."""
+
+
+_AUTO_RESOLUTION_FALLBACK_COMMENT = (
+    "Automated Integration could not land this issue's parallel Lane after "
+    f"{_AUTO_RESOLUTION_MAX_ATTEMPTS} auto-resolution attempts (merge conflict "
+    "or feedback-loop failure). Base stayed green; falling back to a serial "
+    "Iteration and keeping the Lane branch as a breadcrumb. -- copiloop"
+)
+"""The single automated breadcrumb left on an issue that fell back to serial."""
+
+
+def _integration_worktree_path(
+    repo_root: Path, run_id: str, issue_number: int | str
+) -> Path:
+    """Compute an auto-resolution integration worktree path (#63, ADR-0009).
+
+    Integration recovery for a red / conflicting Lane runs its dedicated
+    auto-resolution agent in ``<repo_root>.worktrees/<run_id>/integrate/issue-<N>``
+    — a sibling of the Lane worktrees under the same per-run directory but in an
+    ``integrate/`` subgroup, so it never collides with the Lane's own
+    ``issue-<N>`` worktree. The leaf stays ``issue-<N>`` (matching
+    :func:`_lane_worktree_path`) so the worktree still addresses exactly one
+    issue.
+    """
+    return (
+        repo_root.parent
+        / f"{repo_root.name}.worktrees"
+        / run_id
+        / "integrate"
+        / f"issue-{issue_number}"
+    )
+
+
 class _Loop:
     """Stateful orchestrator for one ``ralph-afk`` invocation.
 
@@ -1335,11 +1370,13 @@ class _ParallelLoop:
                     "worktree remove for %s failed: %s", lane.path, exc
                 )
 
-        # 3.5) Integration (#62, ADR-0009): serialized, deterministic land of the
-        #     green Lane branches on base + issue closure. Operates on branch
-        #     names in the main worktree, so it runs after the worktrees are gone
-        #     and before the round's single Strike tick.
-        integration_successes = self._integrate_wave(iter_num, lanes)
+        # 3.5) Integration (#62 + #63, ADR-0009): serialized, deterministic land
+        #     of the green Lane branches on base + issue closure, with revert +
+        #     bounded auto-resolution + serial fallback for red / conflicting
+        #     Lanes so base stays green. Operates on branch names in the main
+        #     worktree, so it runs after the Lane worktrees are gone and before
+        #     the round's single Strike tick.
+        integration_successes = await self._integrate_wave(iter_num, lanes)
 
         # 4) Strike tick — once per round. A successful Integration is the round's
         #    progress signal (ADR-0009): Lane commits count only once they LAND on
@@ -1483,105 +1520,336 @@ class _ParallelLoop:
         )
         return sha
 
-    def _integrate_wave(self, iter_num: int, lanes: list[_Lane]) -> int:
-        """Serialized happy-path Integration for a Wave's Lanes (#62, ADR-0009).
+    async def _integrate_wave(self, iter_num: int, lanes: list[_Lane]) -> int:
+        """Serialized, robust Integration for a Wave's Lanes (#62 + #63, ADR-0009).
 
-        Ends the Wave by landing each green Lane branch on the base branch in
-        **ascending issue-number order** (see :func:`_lane_sort_key`), so the
-        merge sequence is deterministic and reproducible. Per Lane, in order:
+        Lands each green Lane branch on base in **ascending issue-number order**
+        (see :func:`_lane_sort_key`), keeping the base branch always green and
+        never waiting on a human. Per Lane, in order (see :meth:`_integrate_lane`):
 
-        1. Merge the Lane branch into base (a merge commit — see
-           :meth:`~ralph_afk.git.GitClient.merge`).
-        2. Re-run the full feedback loops from the *runner* side via the injected
-           :class:`~ralph_afk.gate.GateRunner` as the load-bearing quality gate.
-        3. On **green**, count the Integration a success (the round's Strike
-           progress signal), close the issue via the same runner-driven closure
-           as serial mode (``source.handle_completions`` -> ``gh issue close`` +
-           the ``Closes #N`` backstop, emitting one ``wrapper.auto_close`` per
-           closure), and delete the integrated Lane branch.
+        1. Merge the Lane branch into base and re-run the full feedback loops from
+           the *runner* side via the injected :class:`~ralph_afk.gate.GateRunner`.
+        2. On **green**, land it — close the issue via the same runner-driven
+           closure as serial mode (``source.handle_completions`` -> ``gh issue
+           close`` + the ``Closes #N`` backstop, one ``wrapper.auto_close`` per
+           closure) and delete the integrated Lane branch — and count it a success
+           (the round's Strike progress signal).
+        3. A merge **conflict** (:meth:`~ralph_afk.git.GitClient.abort_merge`) or a
+           clean merge whose gate goes **red** or cannot run
+           (:meth:`~ralph_afk.git.GitClient.revert_merge`) is undone so base stays
+           green, then handed to a bounded (K=:data:`_AUTO_RESOLUTION_MAX_ATTEMPTS`)
+           auto-resolution agent in a dedicated integration worktree on base
+           (:meth:`_auto_resolve_lane`). A green attempt lands and counts as a
+           success; after K failures the issue falls back to a serial Iteration
+           with exactly one breadcrumb comment and its Lane branch is kept.
 
-        A merge that conflicts, a gate that cannot run (:exc:`~ralph_afk.gate.
-        GateError`), or a **red** gate is warned and that Lane is skipped, leaving
-        its branch as a breadcrumb — robust conflict / failure handling (revert +
-        auto-resolution + serial fallback) is the next slice (#63); this slice is
-        the happy path only.
-
-        Returns the number of Lanes whose Integration went green — the round's
-        progress for the Strike tick. Closure firing is *decoupled* from that
-        count: an already-closed (or un-closable) issue whose branch still landed
-        green counts as a successful Integration.
+        Returns the number of Lanes that landed green — via the happy path or
+        auto-resolution — which is the round's Strike progress. A reverted-then-
+        recovered Lane counts once; a fallback Lane counts zero.
         """
         successes = 0
         for lane in sorted(lanes, key=_lane_sort_key):
-            ref = lane.item.ref
-            try:
-                pre_base = self._git.head_sha()
-            except git_module.GitError as exc:
-                self._diag.warning(
-                    "integration #%s: base head_sha failed: %s; skipping",
-                    ref, exc,
-                )
-                continue
-
-            try:
-                self._git.merge(lane.branch)
-            except git_module.GitError as exc:
-                # A conflict (or other merge failure): base did not advance.
-                # #63 owns revert + auto-resolution; here we skip and keep the
-                # branch as a breadcrumb.
-                self._diag.warning(
-                    "integration #%s: merge of %s failed: %s; skipping "
-                    "(auto-resolution is #63)",
-                    ref, lane.branch, exc,
-                )
-                continue
-
-            try:
-                result = self._gate_runner.run(self._repo_root)
-            except gate_module.GateError as exc:
-                self._diag.warning(
-                    "integration #%s: gate could not run: %s; skipping",
-                    ref, exc,
-                )
-                continue
-            if not result.passed:
-                self._diag.warning(
-                    "integration #%s: gate failed on %r; skipping "
-                    "(auto-resolution is #63)",
-                    ref,
-                    result.failure.name if result.failure else "unknown",
-                )
-                continue
-
-            # Green: the Lane landed on base and the feedback loops pass.
-            successes += 1
-            try:
-                post_base = self._git.head_sha()
-                landed = self._git.commits_between(pre_base, post_base)
-            except git_module.GitError as exc:
-                self._diag.warning(
-                    "integration #%s: post-merge accounting failed: %s",
-                    ref, exc,
-                )
-                landed = []
-            for completion in self._serial._handle_completions_safely(
-                [lane.item], landed
-            ):
-                self._serial._emit(
-                    events_module.WRAPPER_AUTO_CLOSE,
-                    iter_num=iter_num,
-                    issue=completion.ref,
-                    sha=completion.sha,
-                    shas=list(completion.shas),
-                )
-            try:
-                self._git.delete_branch(lane.branch)
-            except git_module.GitError as exc:
-                self._diag.warning(
-                    "integration #%s: delete of %s failed: %s",
-                    ref, lane.branch, exc,
-                )
+            successes += await self._integrate_lane(iter_num, lane)
         return successes
+
+    async def _integrate_lane(self, iter_num: int, lane: _Lane) -> int:
+        """Integrate one Lane; return ``1`` if it landed green, else ``0``.
+
+        The happy path (#62): merge -> gate -> on green :meth:`_land_lane`. On a
+        conflicting merge, or a clean merge whose gate goes red / cannot run, the
+        merge is undone so base stays green and the Lane is handed to
+        :meth:`_auto_resolve_lane` (#63).
+        """
+        ref = lane.item.ref
+        try:
+            pre_base = self._git.head_sha()
+        except git_module.GitError as exc:
+            self._diag.warning(
+                "integration #%s: base head_sha failed: %s; skipping", ref, exc
+            )
+            return 0
+
+        # 1) Attempt the clean landing.
+        try:
+            self._git.merge(lane.branch)
+        except git_module.GitError as exc:
+            # A conflicting merge: unwind it (base untouched) and auto-resolve.
+            self._diag.warning(
+                "integration #%s: merge of %s conflicted: %s; aborting and "
+                "auto-resolving",
+                ref, lane.branch, exc,
+            )
+            self._abort_merge_safely(ref)
+            return await self._auto_resolve_lane(iter_num, lane)
+
+        # 2) Merge landed cleanly — gate it from the runner side.
+        if self._gate_green(ref, "post-merge"):
+            self._land_lane(iter_num, lane, pre_base)
+            return 1
+
+        # 3) Clean merge but a red / un-runnable gate: revert so base stays
+        #    green, then auto-resolve.
+        self._revert_merge_safely(ref)
+        return await self._auto_resolve_lane(iter_num, lane)
+
+    def _gate_green(
+        self, ref: int | str, phase: str, worktree: Path | None = None
+    ) -> bool:
+        """Run the injected gate on ``worktree`` (default repo root); ``True`` == green.
+
+        A **red** gate or a :exc:`~ralph_afk.gate.GateError` (cannot gate at all)
+        both return ``False`` — Integration then reverts / aborts and drives
+        auto-resolution; the ``phase`` label enriches the diagnostic.
+        """
+        target = worktree if worktree is not None else self._repo_root
+        try:
+            result = self._gate_runner.run(target)
+        except gate_module.GateError as exc:
+            self._diag.warning(
+                "integration #%s: %s gate could not run: %s; treating as red",
+                ref, phase, exc,
+            )
+            return False
+        if not result.passed:
+            self._diag.warning(
+                "integration #%s: %s gate failed on %r",
+                ref, phase,
+                result.failure.name if result.failure else "unknown",
+            )
+            return False
+        return True
+
+    def _abort_merge_safely(self, ref: int | str) -> None:
+        """``git merge --abort`` a conflicted merge; a failure only warns."""
+        try:
+            self._git.abort_merge()
+        except git_module.GitError as exc:
+            self._diag.warning(
+                "integration #%s: merge --abort failed: %s", ref, exc
+            )
+
+    def _revert_merge_safely(self, ref: int | str) -> None:
+        """``git revert`` a clean-but-red landing so base stays green.
+
+        A failed revert is escalated to ``error`` — base may be left carrying a
+        red merge, which the operator needs to see.
+        """
+        try:
+            self._git.revert_merge()
+        except git_module.GitError as exc:
+            self._diag.error(
+                "integration #%s: revert of red merge failed: %s; base may "
+                "carry a red commit",
+                ref, exc,
+            )
+
+    def _land_lane(self, iter_num: int, lane: _Lane, pre_base: str) -> None:
+        """Finish a green landing: close the issue + delete the integrated branch."""
+        self._close_landed(iter_num, lane.item, pre_base)
+        self._delete_branch_safely(lane.item.ref, lane.branch)
+
+    def _close_landed(
+        self, iter_num: int, item: AfkReadyItem, pre_base: str
+    ) -> None:
+        """Close a landed issue via the serial closure path + emit ``auto_close``.
+
+        Reads the commits the landing added to base (``pre_base`` -> current
+        head) and drives the same runner-side closure as serial mode
+        (``source.handle_completions`` -> ``gh issue close`` + the ``Closes #N``
+        backstop), emitting one ``wrapper.auto_close`` per closure. Shared by the
+        happy-path landing and a successful auto-resolution landing.
+        """
+        try:
+            post_base = self._git.head_sha()
+            landed = self._git.commits_between(pre_base, post_base)
+        except git_module.GitError as exc:
+            self._diag.warning(
+                "integration #%s: post-merge accounting failed: %s",
+                item.ref, exc,
+            )
+            landed = []
+        for completion in self._serial._handle_completions_safely(
+            [item], landed
+        ):
+            self._serial._emit(
+                events_module.WRAPPER_AUTO_CLOSE,
+                iter_num=iter_num,
+                issue=completion.ref,
+                sha=completion.sha,
+                shas=list(completion.shas),
+            )
+
+    def _delete_branch_safely(self, ref: int | str, branch: str) -> None:
+        """``git branch -D`` an integrated branch; a failure only warns."""
+        try:
+            self._git.delete_branch(branch)
+        except git_module.GitError as exc:
+            self._diag.warning(
+                "integration #%s: delete of %s failed: %s", ref, branch, exc
+            )
+
+    async def _auto_resolve_lane(self, iter_num: int, lane: _Lane) -> int:
+        """Bounded auto-resolution for a reverted / aborted Lane (#63, ADR-0009).
+
+        Creates ONE dedicated integration worktree on base and, up to
+        K=:data:`_AUTO_RESOLUTION_MAX_ATTEMPTS` times, runs a fresh resolution
+        agent session pinned to it (:meth:`_run_resolution_session`) and re-gates
+        that worktree. The first **green** attempt merges the integration branch
+        onto base, closes the issue, deletes both the integration branch and the
+        (now-landed) Lane branch, and returns ``1``. If all K attempts stay red
+        the Lane falls back to a serial Iteration
+        (:meth:`_fallback_lane_to_serial`) and returns ``0``. The integration
+        worktree and branch are always reaped; the Lane branch is kept only on
+        failure (a breadcrumb).
+        """
+        ref = lane.item.ref
+        if not isinstance(ref, int):
+            # Auto-resolution addresses one integer issue (its worktree / branch
+            # names derive from the number); a non-int ref cannot be recovered.
+            self._fallback_lane_to_serial(lane)
+            return 0
+
+        base = self._resolve_base_ref()
+        int_branch = git_module.integration_branch_name(self._run_id, ref)
+        int_path = _integration_worktree_path(self._repo_root, self._run_id, ref)
+        try:
+            int_git = self._git.add_worktree(
+                int_path, branch=int_branch, base=base
+            )
+        except git_module.GitError as exc:
+            self._diag.warning(
+                "integration #%s: could not create integration worktree: %s; "
+                "falling back to serial",
+                ref, exc,
+            )
+            self._fallback_lane_to_serial(lane)
+            return 0
+
+        landed = False
+        try:
+            for attempt in range(1, _AUTO_RESOLUTION_MAX_ATTEMPTS + 1):
+                try:
+                    pre_base = self._git.head_sha()
+                except git_module.GitError as exc:
+                    self._diag.warning(
+                        "integration #%s: base head_sha failed before "
+                        "auto-resolution attempt %s: %s",
+                        ref, attempt, exc,
+                    )
+                    break
+                await self._run_resolution_session(
+                    iter_num, lane, int_git, attempt
+                )
+                if not self._gate_green(
+                    ref, f"auto-resolution attempt {attempt}", int_path
+                ):
+                    continue
+                # Green: land the resolved integration branch on base.
+                try:
+                    self._git.merge(int_branch)
+                except git_module.GitError as exc:
+                    self._diag.warning(
+                        "integration #%s: merge of resolved %s failed: %s; "
+                        "retrying",
+                        ref, int_branch, exc,
+                    )
+                    continue
+                self._close_landed(iter_num, lane.item, pre_base)
+                self._delete_branch_safely(ref, lane.branch)
+                landed = True
+                break
+        finally:
+            try:
+                self._git.remove_worktree(int_path, force=True)
+            except git_module.GitError as exc:
+                self._diag.warning(
+                    "integration #%s: integration worktree remove failed: %s",
+                    ref, exc,
+                )
+            self._delete_branch_safely(ref, int_branch)
+
+        if not landed:
+            self._fallback_lane_to_serial(lane)
+            return 0
+        return 1
+
+    async def _run_resolution_session(
+        self,
+        iter_num: int,
+        lane: _Lane,
+        int_git: git_module.GitClient,
+        attempt: int,
+    ) -> None:
+        """Run one auto-resolution agent session in the integration worktree (#63).
+
+        A fresh :class:`IterationSession` pinned to the dedicated integration
+        worktree, tasked to merge the Lane branch, resolve conflicts, make the
+        feedback loops pass, and commit. Bulletproof like
+        :meth:`_run_lane_session` — a timeout or error is logged and swallowed so
+        the attempt just reads as still-red and the bound advances.
+        """
+        prompt = self._resolution_prompt(lane, attempt)
+        send_timeout = _send_timeout_seconds()
+        try:
+            async with IterationSession(
+                self._client,
+                config=self._config,
+                event_log=self._writers.event_log,
+                sinks=self._sinks,
+                run_id=self._run_id,
+                iter_num=iter_num,
+                model=self._config.model,
+                reasoning_effort=self._config.reasoning_effort,
+                working_directory=str(int_git.root),
+            ) as sdk_session:
+                try:
+                    await sdk_session.send_and_wait(prompt, timeout=send_timeout)
+                except asyncio.TimeoutError:
+                    self._diag.warning(
+                        "integration #%s: auto-resolution attempt %s timed out "
+                        "after %ss; treating as still-red",
+                        lane.item.ref, attempt, send_timeout,
+                    )
+                except Exception as exc:
+                    self._diag.warning(
+                        "integration #%s: auto-resolution attempt %s raised "
+                        "%s: %s; treating as still-red",
+                        lane.item.ref, attempt, type(exc).__name__, exc,
+                    )
+        except Exception as exc:
+            self._diag.error(
+                "integration #%s: auto-resolution session lifecycle failed: "
+                "%s: %s",
+                lane.item.ref, type(exc).__name__, exc,
+            )
+
+    def _resolution_prompt(self, lane: _Lane, attempt: int) -> str:
+        """The dedicated auto-resolution brief (#63).
+
+        Unlike a Lane / serial prompt this is not issue-collection work: it asks
+        the agent to merge the Lane branch into the integration worktree's base,
+        fix any conflicts, make the feedback loops green, and commit — driving a
+        clean Integration the runner can then land.
+        """
+        return (
+            f"Auto-resolution attempt {attempt} of "
+            f"{_AUTO_RESOLUTION_MAX_ATTEMPTS} for issue #{lane.item.ref}. Merge "
+            f"branch {lane.branch} into this integration worktree's base branch, "
+            f"resolve any merge conflicts, make all feedback loops in AGENTS.md "
+            f"pass, and commit the result. {self._prompt_text}"
+        )
+
+    def _fallback_lane_to_serial(self, lane: _Lane) -> None:
+        """Terminal auto-resolution failure -> fall back to a serial Iteration (#63).
+
+        Posts exactly one automated breadcrumb comment on the issue and leaves it
+        **OPEN** — and in :attr:`_worked`, so it is never re-Laned — so a later
+        round, finding no fresh eligible ``parallel-safe`` work, runs a serial
+        ``_run_one_iteration`` (the proven safe path) that re-collects the issue
+        and works it. The failed Lane branch is intentionally **kept** (never
+        deleted) as a breadcrumb.
+        """
+        self._source.comment(lane.item.ref, _AUTO_RESOLUTION_FALLBACK_COMMENT)
 
     def _tick_round(
         self, iter_num: int, *, commits: int, closures: int
