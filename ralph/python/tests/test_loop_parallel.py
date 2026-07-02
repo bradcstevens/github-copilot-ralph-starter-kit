@@ -1,19 +1,21 @@
-"""End-to-end integration tests for Parallel mode (#61, ADR-0008).
+"""End-to-end integration tests for Parallel mode (#61/#62, ADR-0008/0009).
 
 Drives the opt-in Wave/Lane orchestrator through the public
 :func:`ralph_afk.loop.run` seam with the SDK + git / gh / gate seams faked,
 asserting the **observable effects** of concurrent isolated execution — one
 worktree + branch per Lane created in a sibling directory, each session pinned
 to its Lane's worktree via ``working_directory``, per-Lane commits landing on
-Lane branches (never on base), and the worktrees torn down at the Wave barrier
-— not internal call ordering.
+Lane branches, and the worktrees torn down at the Wave barrier — not internal
+call ordering.
 
 The fakes here (unlike the serial ``test_iteration_end_to_end`` client) record
 the per-session ``working_directory`` and route each Lane's simulated agent
 commit to the *right* worktree's child :class:`~tests.fakes.FakeGitClient`, so
-the test can prove per-Lane isolation. Landing green Lanes on base + closing
-their issues is Integration (#62/#63), NOT this slice, so a Wave here makes no
-base-branch closures.
+the test can prove per-Lane isolation. At the Wave barrier **Integration** (#62)
+lands each green Lane's branch on base in ascending issue-number order, gates it
+via the injected :class:`~ralph_afk.gate.GateRunner`, and closes the issue with
+the serial closure semantics; a red gate skips the Lane and keeps its branch as
+a breadcrumb (revert + auto-resolution is #63).
 """
 
 from __future__ import annotations
@@ -439,6 +441,10 @@ def test_parallel_integration_lands_and_closes_in_ascending_issue_order(
     auto_closes = [e for e in events if e["type"] == "wrapper.auto_close"]
     assert [e["issue"] for e in auto_closes] == [42, 43]
 
+    # A successful Integration counts as Strike progress: the round landed two
+    # Lanes, so the shared Strike machine saw progress and recorded no strike.
+    assert [e for e in events if e["type"] == "wrapper.strike"] == []
+
     # Both green Lanes landed on base (base advanced past the prior commit) and
     # both integrated branches were deleted.
     assert fake_git.head_sha() != "0000000000000000000000000000000000000001"
@@ -449,3 +455,71 @@ def test_parallel_integration_lands_and_closes_in_ascending_issue_order(
 
     # Integration ran after the Wave barrier — no worktrees left live.
     assert fake_git.active_worktrees == []
+
+
+def test_parallel_integration_red_gate_keeps_branch_and_records_strike(
+    tmp_path, monkeypatch
+) -> None:
+    """A red gate lands nothing: no closures, branches kept, and the round strikes.
+
+    Happy-path Integration (#62) skips a Lane whose feedback loops go red,
+    leaving its branch as a breadcrumb (revert + auto-resolution is #63). With
+    every Lane's gate red, the Wave lands nothing — and since a successful
+    Integration is the round's only Strike-progress signal, the no-progress
+    round adds one strike. This is the contrapositive of "a successful
+    Integration counts as Strike progress": a Wave that integrates nothing is
+    not progress. Assertions are on observable effects only.
+    """
+    fake_git = _wire_repo(tmp_path)
+    monkeypatch.setattr(loop_module, "_make_git_client", lambda: fake_git)
+
+    fake_gh = FakeGitHubClient(
+        repo=gh_module.Repo(owner="x", name="y", default_branch="main"),
+        issues=[
+            _make_issue(42, labels=["ready-for-agent", "parallel-safe"]),
+            _make_issue(43, labels=["ready-for-agent", "parallel-safe"]),
+        ],
+    )
+    monkeypatch.setattr(loop_module, "_make_github_client", lambda: fake_gh)
+
+    fake_client = _ParallelFakeClient(
+        fake_git=fake_git,
+        scripted_events=[_usage_event("claude-opus-4.8-max")],
+    )
+    monkeypatch.setattr(loop_module, "_make_client", lambda: fake_client)
+    # All-red gate: every Lane's feedback loops fail, so no Lane lands.
+    monkeypatch.setattr(
+        loop_module, "_make_gate_runner", lambda: FakeGateRunner(default=False)
+    )
+
+    cfg = RunConfig(
+        model="claude-opus-4.8-max",
+        issue_source="github",
+        parallel=2,
+        max_iterations=1,
+        max_nmt_strikes=3,
+        verbosity=0,
+        render_reasoning=False,
+    )
+
+    exit_code = asyncio.run(loop_module.run(cfg))
+
+    # One warn strike (1 < 3) does not abort the run; the iteration cap ends it.
+    assert exit_code == 0, f"expected exit 0, got {exit_code}"
+
+    # Nothing landed: no issue closed and both remain OPEN.
+    assert fake_gh.issue_close_calls == []
+    assert fake_gh.issue_view(42).state == "OPEN"
+    assert fake_gh.issue_view(43).state == "OPEN"
+
+    # Both Lane branches kept as breadcrumbs (a red gate deletes nothing).
+    assert fake_git.branch_deletes == []
+
+    # The no-progress Wave recorded exactly one warn strike, and Integration
+    # closed nothing.
+    events = _logged_events(tmp_path)
+    strikes = [e for e in events if e["type"] == "wrapper.strike"]
+    assert len(strikes) == 1
+    assert strikes[0]["outcome"] == "warn"
+    assert strikes[0]["strikes"] == 1
+    assert [e for e in events if e["type"] == "wrapper.auto_close"] == []
