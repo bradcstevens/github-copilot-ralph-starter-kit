@@ -1,6 +1,8 @@
 # Per-Iteration local sandbox for the AFK loop
 
-**Status:** accepted
+**Status:** blocked — the chosen mechanism does not survive the feasibility spike; see
+[Spike outcome](#spike-outcome-2026-07-02-mechanism-not-deliverable-on-the-pinned-toolchain).
+Blocked pending upstream headless-sandbox support.
 
 ## Context
 
@@ -8,8 +10,9 @@ The AFK loop drives Copilot through the Python SDK (`github-copilot-sdk`), **not
 interactive CLI, so the documented `/sandbox` slash command is not our integration
 surface. We want each agent **Iteration** to run its shell commands inside GitHub
 Copilot's local (macOS seatbelt) sandbox, fresh per Iteration, to contain one issue's
-filesystem blast radius. Two frictions shape the design: (1) SDK 1.0.2 `create_session()`
-exposes **no** `sandbox` kwarg — though the `session.create` wire payload carries a
+filesystem blast radius. Two frictions shape the design: (1) the Python SDK
+`create_session()` exposes **no** `sandbox` kwarg (verified through 1.0.5 / 1.0.6rc0)
+— though the `session.create` wire payload carries a
 `sandbox_config` field — and (2) the agent itself runs `git push` / `gh` to close issues
 (PROMPT.md), so the sandbox cannot cut network or keychain without breaking the
 close-the-issue flow.
@@ -64,3 +67,43 @@ per-tool `sandboxed` flag is cross-checked against the intended posture to catch
 - Feature is public preview and macOS-first (Windows needs Insiders; Linux differs;
   per-host network allow/block rules are unreliable) — hence default-on-with-degrade
   rather than hard-require.
+
+## Spike outcome (2026-07-02): mechanism not deliverable on the pinned toolchain
+
+A feasibility spike drove real SDK sessions against the runtime and probed the agent's
+shell for the SDK's per-tool `sandboxed` flag plus *actual* write containment (the agent
+attempts a write to `$HOME`, which a working sandbox must block, while a write inside the
+working directory and outbound `curl` must succeed). It was run against **both** the
+originally-pinned stack (`github-copilot-sdk 1.0.2`, bundled CLI **1.0.68**) and the
+current pin (`github-copilot-sdk 1.0.5`, which auto-downloads CLI **1.0.67** to
+`~/Library/Caches/github-copilot-sdk/cli/`) — **identical result on both**. **Every
+available lever failed to sandbox the headless session:**
+
+- `settings.json` `sandbox` block (authoritative `SandboxConfig` schema) supplied via
+  `config_directory` + `enable_config_discovery` — `sandboxed=None`, `$HOME` writable.
+- `sandbox_config` injected directly into the `session.create` wire payload — no effect.
+- `experimental: true` in `settings.json` **and** the `--experimental` flag on the
+  spawned runtime — no effect.
+- All of the above combined ("kitchen sink") — `sandboxed` never `true`, the `$HOME`
+  write succeeded, and no sandbox lifecycle events were emitted.
+
+Corroborating findings:
+
+- No Python SDK through the latest stable **1.0.5** (nor `1.0.6rc0`) exposes a native
+  `sandbox` kwarg on `create_session`; the RPC types (`SandboxConfig`,
+  `ToolExecutionCompleteData.sandboxed`) are forward-declared only.
+- CLI **1.0.67** (SDK-pinned) / **1.0.68** (latest published) expose **no** sandbox CLI
+  flag or `--help` text, and the SDK always spawns the CLI with `--headless`.
+- The feature *is* present for **interactive** use (the `/sandbox` TUI, `footer.showSandbox`,
+  the `experimental` setting), so the gap is specifically the **headless / SDK path** the
+  runner depends on: local-sandbox enforcement is currently wired to interactive sessions
+  only.
+
+**Consequence for this ADR:** the chosen mechanism *and* its payload-injection fallback
+cannot be delivered on the pinned toolchain. Because the `sandboxed` hook never reports
+`true` in headless, even the "default-on, graceful-degrade" build would be *permanently*
+degraded (announcing a sandbox while never actually sandboxing) — worse than not shipping,
+since it implies protection that is not there. This ADR is therefore **blocked pending
+upstream support**: either (a) a Python SDK release that exposes a native sandbox kwarg
+on `create_session`, or (b) a CLI release that applies the local sandbox in `--headless`
+mode. **Revisit trigger:** either (a) or (b) ships. Until then, no runner change is made.
