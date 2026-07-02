@@ -16,12 +16,19 @@ lands each green Lane's branch on base in ascending issue-number order, gates it
 via the injected :class:`~ralph_afk.gate.GateRunner`, and closes the issue with
 the serial closure semantics; a red gate skips the Lane and keeps its branch as
 a breadcrumb (revert + auto-resolution is #63).
+
+**Drain-everything (#67, ADR-0008).** A Parallel run interleaves Waves for the
+``parallel-safe`` issues with serial Iterations for every other
+``ready-for-agent`` issue, in one run, draining all eligible work with the
+Strike machine ticking once per round (a Wave or a serial Iteration): see
+:func:`test_parallel_run_drains_waves_then_serial_in_one_run`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -62,11 +69,13 @@ class _ParallelFakeSession:
         working_directory: str | None,
         fake_git: FakeGitClient,
         scripted_events: list[SessionEvent],
+        serial_closes: bool = False,
     ) -> None:
         self._on_event = on_event
         self._working_directory = working_directory
         self._fake_git = fake_git
         self._scripted_events = scripted_events
+        self._serial_closes = serial_closes
         self.session_id = f"fake-session-{working_directory}"
         self.send_and_wait_calls: list[tuple[str, float]] = []
 
@@ -85,7 +94,20 @@ class _ParallelFakeSession:
             body = f"Closes #{ref}"
         else:
             target = self._fake_git
+            # The serial-fallback agent "picks one" issue and closes it. Parse
+            # the pool from the rendered ``=== Issue #N:`` block HEADERS only
+            # (never the Previous-commits block, which can carry a stale
+            # ``Closes #N``), pick the lowest, and reference it so the reused
+            # serial closure path fires — enough to drain a plain
+            # ``ready-for-agent`` issue and let a multi-round run reach an empty
+            # pool. Opt-in so the no-progress serial fakes keep their behaviour.
             body = ""
+            if self._serial_closes:
+                refs = [
+                    int(n) for n in re.findall(r"=== Issue #(\d+):", prompt)
+                ]
+                if refs:
+                    body = f"Closes #{min(refs)}"
         if target is not None:
             target.simulate_agent_commit(
                 subject="feat(lane): implement issue",
@@ -115,9 +137,11 @@ class _ParallelFakeClient:
         *,
         fake_git: FakeGitClient,
         scripted_events: list[SessionEvent],
+        serial_closes: bool = False,
     ) -> None:
         self._fake_git = fake_git
         self._scripted_events = scripted_events
+        self._serial_closes = serial_closes
         self.create_calls: list[dict[str, Any]] = []
         self.created: list[_ParallelFakeSession] = []
         self.stop_call_count = 0
@@ -140,6 +164,7 @@ class _ParallelFakeClient:
             working_directory=working_directory,
             fake_git=self._fake_git,
             scripted_events=self._scripted_events,
+            serial_closes=self._serial_closes,
         )
         self.created.append(session)
         return session
@@ -523,3 +548,122 @@ def test_parallel_integration_red_gate_keeps_branch_and_records_strike(
     assert strikes[0]["outcome"] == "warn"
     assert strikes[0]["strikes"] == 1
     assert [e for e in events if e["type"] == "wrapper.auto_close"] == []
+
+
+def test_parallel_run_drains_waves_then_serial_in_one_run(
+    tmp_path, monkeypatch
+) -> None:
+    """Drain-everything (#67, ADR-0008): Waves for parallel-safe, serial for the rest.
+
+    A Parallel run must never strand eligible work: it interleaves a **Wave**
+    for the ``parallel-safe`` issues with normal serial **Iterations** for every
+    other ``ready-for-agent`` issue, in one run, until the pool is drained. The
+    pool mixes two ``parallel-safe`` issues (42, 43) with one plain
+    ``ready-for-agent`` issue (44). Driven through ``run(config)`` with
+    ``max_iterations=0`` (run until the pool empties) and an all-green gate, this
+    asserts (observable effects only):
+
+    * **Round 1 is a Wave** — only 42 and 43 (the human-asserted ``parallel-safe``
+      issues) become Lanes with their own worktree + branch; 44 never does.
+    * **A later round is serial** — exactly one unpinned session, whose prompt
+      carries the plain issue 44 and no longer carries the already-closed 42/43
+      (eligibility is a human assertion, so 44 is worked serially, not dropped).
+    * **No stranding** — all three issues close (42/43 via Integration, 44 via the
+      serial closure path) and the run terminates by draining the pool
+      (``empty_pool``), not by hitting the iteration cap or a strike abort.
+    * **Correct round-level Strike accounting across both kinds of round** — the
+      Wave landed two Lanes (progress) and the serial Iteration committed + closed
+      (progress), so no round records a strike.
+    """
+    fake_git = _wire_repo(tmp_path)
+    monkeypatch.setattr(loop_module, "_make_git_client", lambda: fake_git)
+
+    fake_gh = FakeGitHubClient(
+        repo=gh_module.Repo(owner="x", name="y", default_branch="main"),
+        issues=[
+            _make_issue(42, labels=["ready-for-agent", "parallel-safe"]),
+            _make_issue(43, labels=["ready-for-agent", "parallel-safe"]),
+            _make_issue(44, labels=["ready-for-agent"]),
+        ],
+    )
+    monkeypatch.setattr(loop_module, "_make_github_client", lambda: fake_gh)
+
+    # serial_closes: the serial-fallback session "picks one" issue and closes it,
+    # so a plain ``ready-for-agent`` issue actually drains and the run can reach
+    # an empty pool rather than looping until a strike abort.
+    fake_client = _ParallelFakeClient(
+        fake_git=fake_git,
+        scripted_events=[_usage_event("claude-opus-4.8-max")],
+        serial_closes=True,
+    )
+    monkeypatch.setattr(loop_module, "_make_client", lambda: fake_client)
+    # All-green gate: every landed Lane's feedback loops pass, so both parallel-
+    # safe Lanes land at Integration.
+    monkeypatch.setattr(
+        loop_module, "_make_gate_runner", lambda: FakeGateRunner()
+    )
+
+    cfg = RunConfig(
+        model="claude-opus-4.8-max",
+        issue_source="github",
+        parallel=2,
+        max_iterations=0,  # unlimited: drive until the pool drains
+        max_nmt_strikes=3,
+        verbosity=0,
+        render_reasoning=False,
+    )
+
+    exit_code = asyncio.run(loop_module.run(cfg))
+
+    assert exit_code == 0, f"expected a clean drain (exit 0), got {exit_code}"
+
+    # --- Round 1 was a Wave: only the two parallel-safe issues became Lanes,
+    #     each with its own worktree + branch. The plain issue 44 never did —
+    #     eligibility is a human assertion, never inferred.
+    adds = fake_git.worktree_adds
+    assert len(adds) == 2, f"expected exactly two Lane worktrees (42,43), got {adds}"
+    waved = sorted(int(b.split("/issue-")[1]) for (_p, b, _base) in adds)
+    assert waved == [42, 43], "only the parallel-safe issues become Lanes"
+
+    # --- A later round was serial: exactly one unpinned session; the two Lane
+    #     sessions were worktree-pinned. Three sessions total across the run.
+    working_dirs = [c["working_directory"] for c in fake_client.create_calls]
+    assert working_dirs.count(None) == 1, "exactly one serial (unpinned) session"
+    assert sum(wd is not None for wd in working_dirs) == 2, (
+        "both Lane sessions were worktree-pinned"
+    )
+
+    # --- The serial round worked the plain issue AFTER the Wave closed 42/43:
+    #     its prompt carries #44 and no longer carries the closed parallel-safe
+    #     issues, so opting into Parallel mode strands nothing.
+    serial_idx = working_dirs.index(None)
+    serial_session = fake_client.created[serial_idx]
+    serial_prompt, _timeout = serial_session.send_and_wait_calls[0]
+    assert "=== Issue #44:" in serial_prompt
+    assert "=== Issue #42:" not in serial_prompt
+    assert "=== Issue #43:" not in serial_prompt
+
+    # --- No stranding: all three issues closed — 42/43 via Integration, 44 via
+    #     the serial closure path — and each actually flipped CLOSED in the store.
+    assert sorted(n for (n, _c) in fake_gh.issue_close_calls) == [42, 43, 44]
+    for n in (42, 43, 44):
+        assert fake_gh.issue_view(n).state == "CLOSED", f"#{n} was not closed"
+
+    events = _logged_events(tmp_path)
+
+    # --- Correct round-level Strike accounting across BOTH kinds of round: the
+    #     Wave (two landed Lanes) and the serial Iteration (a commit + a closure)
+    #     each made progress, so no round recorded a strike.
+    assert [e for e in events if e["type"] == "wrapper.strike"] == []
+
+    # --- The run terminated by draining the pool, not by the iteration cap or a
+    #     strike abort.
+    run_end = next(e for e in events if e["type"] == "wrapper.run.end")
+    assert run_end["outcome"] == "empty_pool"
+
+    # --- One auto_close per issue: the parallel-safe pair first (Wave /
+    #     Integration, ascending), then the plain issue (serial round).
+    auto_closes = [
+        e["issue"] for e in events if e["type"] == "wrapper.auto_close"
+    ]
+    assert auto_closes == [42, 43, 44]
